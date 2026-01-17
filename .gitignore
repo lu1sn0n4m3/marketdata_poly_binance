@@ -9,6 +9,8 @@ __pycache__/
 #Examples
 examples/
 
+# Data
+data/
 # Distribution / packaging
 .Python
 build/

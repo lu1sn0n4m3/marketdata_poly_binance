@@ -1,0 +1,23 @@
+{
+  "ts": "2026-01-17T21:02:32.274111+00:00",
+  "uptime_seconds": 3060,
+  "current_hour": "2026-01-17T21:00:00Z",
+  "active_streams": 3,
+  "streams": [
+    {
+      "venue": "polymarket",
+      "stream_id": "bitcoin-up-or-down",
+      "last_event_ts_ms": 1768683721044
+    },
+    {
+      "venue": "binance",
+      "stream_id": "ETHUSDT",
+      "last_event_ts_ms": 1768683751867
+    },
+    {
+      "venue": "binance",
+      "stream_id": "BTCUSDT",
+      "last_event_ts_ms": 1768683752015
+    }
+  ]
+}
