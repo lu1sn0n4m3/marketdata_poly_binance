@@ -9,8 +9,12 @@ __pycache__/
 #Examples
 examples/
 
-# Data
+# macOS
+.DS_Store
+
+# runtime / generated data
 data/
+collector/data/
 # Distribution / packaging
 .Python
 build/
