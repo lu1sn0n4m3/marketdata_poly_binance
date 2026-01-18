@@ -1,65 +1,57 @@
-"""Write immutable checkpoint Parquet files."""
+"""Write immutable checkpoint Parquet files with strict schemas."""
 
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Fixed schema that always uses plain strings for categorical columns
-# Note: venue and stream_id are excluded - they're already in the partition path
-BASE_SCHEMA = pa.schema([
-    # Required fields (always present)
-    pa.field("ts_event", pa.int64(), nullable=False),
-    pa.field("ts_recv", pa.int64(), nullable=False),
-    pa.field("seq", pa.int64(), nullable=False),
-    
-    # Optional fields (nullable because not all events have all fields)
-    pa.field("event_type", pa.string(), nullable=True),  # Always plain string
-    pa.field("bid_px", pa.float64(), nullable=True),
-    pa.field("bid_sz", pa.float64(), nullable=True),
-    pa.field("ask_px", pa.float64(), nullable=True),
-    pa.field("ask_sz", pa.float64(), nullable=True),
-    pa.field("price", pa.float64(), nullable=True),
-    pa.field("size", pa.float64(), nullable=True),
-    pa.field("side", pa.string(), nullable=True),  # Always plain string
-    pa.field("update_id", pa.int64(), nullable=True),  # Binance BBO
-    pa.field("trade_id", pa.int64(), nullable=True),  # Binance trades
-    pa.field("token_id", pa.string(), nullable=True),  # Polymarket, always plain string
-])
+from ..schemas import get_schema
 
 
-def rows_to_table(rows: List[dict]) -> pa.Table:
+def rows_to_table(rows: List[dict], venue: str, event_type: str) -> pa.Table:
     """
-    Convert rows to Arrow table using fixed schema.
+    Convert rows to Arrow table using the strict schema for (venue, event_type).
     
-    Strips venue/stream_id (already in partition path) and ensures
-    string columns are always plain Python strings (not categorical/dictionary).
+    Args:
+        rows: List of normalized row dictionaries
+        venue: Venue name (for schema lookup)
+        event_type: Event type (for schema lookup)
+    
+    Returns:
+        PyArrow Table with the strict schema
+    
+    Raises:
+        KeyError: If no schema exists for (venue, event_type)
     """
-    # Create a copy of rows without venue/stream_id (they're in the partition path)
+    schema = get_schema(venue, event_type)
+    
+    # Build column arrays from rows
+    # Only include fields that are in the schema
+    field_names = [field.name for field in schema]
+    
     cleaned_rows = []
-    for r in rows:
-        cleaned = {k: v for k, v in r.items() if k not in ("venue", "stream_id")}
-        
-        # Normalize string fields to plain Python strings
-        if "event_type" in cleaned and cleaned.get("event_type") is not None:
-            cleaned["event_type"] = str(cleaned["event_type"])
-        if "side" in cleaned and cleaned.get("side") is not None:
-            cleaned["side"] = str(cleaned["side"])
-        if "token_id" in cleaned and cleaned.get("token_id") is not None:
-            cleaned["token_id"] = str(cleaned["token_id"])
-        
+    for row in rows:
+        cleaned = {}
+        for name in field_names:
+            value = row.get(name)
+            # Ensure strings are plain Python strings
+            if isinstance(value, str):
+                cleaned[name] = str(value)
+            else:
+                cleaned[name] = value
         cleaned_rows.append(cleaned)
     
-    # Create table with explicit schema
-    return pa.Table.from_pylist(cleaned_rows, schema=BASE_SCHEMA)
+    return pa.Table.from_pylist(cleaned_rows, schema=schema)
 
 
 def write_checkpoint(
     tmp_dir: Path,
     venue: str,
     stream_id: str,
+    event_type: str,
     date: str,
     hour: int,
     rows: List[dict],
@@ -67,42 +59,57 @@ def write_checkpoint(
     """
     Write an immutable checkpoint Parquet file.
     
+    File structure:
+        {tmp_dir}/venue={venue}/stream_id={stream_id}/event_type={event_type}/
+                 date={date}/hour={hour:02d}/checkpoint-{timestamp}-{uuid}.parquet
+    
     Args:
-        tmp_dir: /data/tmp base directory
-        venue: venue name
-        stream_id: stream identifier
+        tmp_dir: Base directory for temporary checkpoints (e.g., /data/tmp)
+        venue: Venue name (e.g., "binance", "polymarket")
+        stream_id: Stream identifier (e.g., "BTCUSDT", "bitcoin-up-or-down")
+        event_type: Event type ("bbo" or "trade")
         date: UTC date (YYYY-MM-DD)
         hour: UTC hour (0-23)
-        rows: list of normalized row dictionaries
+        rows: List of normalized row dictionaries
     
     Returns:
         Path to the written checkpoint file
+    
+    Raises:
+        ValueError: If rows is empty
+        KeyError: If no schema exists for (venue, event_type)
     """
     if not rows:
         raise ValueError("Cannot write empty checkpoint")
     
-    # Build checkpoint path: /data/tmp/venue=.../stream_id=.../date=.../hour=.../checkpoint-*.parquet
-    checkpoint_dir = tmp_dir / f"venue={venue}" / f"stream_id={stream_id}" / f"date={date}" / f"hour={hour:02d}"
+    # Build checkpoint directory path with event_type partition
+    checkpoint_dir = (
+        tmp_dir
+        / f"venue={venue}"
+        / f"stream_id={stream_id}"
+        / f"event_type={event_type}"
+        / f"date={date}"
+        / f"hour={hour:02d}"
+    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate checkpoint filename: checkpoint-YYYYMMDDHH-mmss-<uuid>.parquet
-    from datetime import datetime, timezone
+    # Generate unique checkpoint filename
     now = datetime.now(timezone.utc)
     timestamp = now.strftime("%Y%m%d%H-%M%S")
     unique_id = str(uuid.uuid4())[:8]
     filename = f"checkpoint-{timestamp}-{unique_id}.parquet"
     checkpoint_path = checkpoint_dir / filename
     
-    # Convert rows to table with fixed schema
-    table = rows_to_table(rows)
+    # Convert rows to table with strict schema
+    table = rows_to_table(rows, venue, event_type)
     
-    # Write Parquet file with dictionary encoding disabled
-    # This ensures string columns remain plain strings
+    # Write Parquet file
+    # Disable dictionary encoding to ensure consistent string handling
     pq.write_table(
         table,
         checkpoint_path,
         compression="snappy",
-        use_dictionary=False,  # Disable dictionary encoding to prevent schema issues
+        use_dictionary=False,
     )
     
     return checkpoint_path

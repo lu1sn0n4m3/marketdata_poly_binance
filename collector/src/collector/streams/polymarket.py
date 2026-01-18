@@ -3,15 +3,14 @@
 import asyncio
 import logging
 import re
-from time import time_ns
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, Callable, List
+from typing import Callable, Dict, List, Optional
 
+import aiohttp
 import orjson
 import websockets
-import aiohttp
 
-from ..time.boundaries import get_utc_hour_for_timestamp
+from .base import BaseConsumer
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +19,7 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 def parse_polymarket_url(url: str) -> Optional[str]:
-    """Extract full slug from Polymarket URL (like the example)."""
+    """Extract full slug from Polymarket URL."""
     match = re.search(r"/event/([^/?]+)", url)
     return match.group(1) if match else None
 
@@ -29,34 +28,26 @@ def get_eastern_time() -> datetime:
     """
     Get current Eastern Time (ET) from UTC.
     
-    Note: Always uses UTC as the source, not system timezone.
-    ET is UTC-5 (EST) or UTC-4 (EDT).
+    Note: Uses UTC-5 (EST). Daylight saving handling can be added later.
     """
-    # Always use UTC (timezone-independent)
     utc_now = datetime.now(timezone.utc)
-    
-    # Convert to Eastern Time
-    # ET is UTC-5 (EST) or UTC-4 (EDT)
-    # For simplicity, we'll use UTC-5 (EST) - daylight saving handling can be added later
     et_tz = timezone(timedelta(hours=-5))
-    et_now = utc_now.astimezone(et_tz)
-    return et_now
+    return utc_now.astimezone(et_tz)
 
 
 def derive_market_url(market_slug: str, et_time: datetime) -> str:
     """
     Derive Polymarket URL from market slug and Eastern time.
     
-    The URL time is the STARTING time of the market (current hour).
     Format: https://polymarket.com/event/{market-slug}-{month}-{day}-{hour}pm-et
-    Example: bitcoin-up-or-down-january-17-1pm-et (for 1pm-2pm market)
     """
-    month_names = ["january", "february", "march", "april", "may", "june",
-                   "july", "august", "september", "october", "november", "december"]
+    month_names = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ]
     
     month = month_names[et_time.month - 1]
     day = et_time.day
-    # Use current hour as the STARTING time of the market
     hour_12 = et_time.hour % 12
     if hour_12 == 0:
         hour_12 = 12
@@ -79,73 +70,114 @@ async def fetch_token_ids(slug: str) -> List[dict]:
                 if resp.status != 200:
                     logger.warning(f"Gamma API returned {resp.status} for slug {slug}")
                     return []
+                
                 data = await resp.json()
                 if not data:
                     return []
+                
                 event = data[0] if isinstance(data, list) else data
                 result = []
+                
                 for m in event.get("markets", []):
                     if not m.get("active", True):
                         continue
+                    
                     outcomes = m.get("outcomes", [])
                     if isinstance(outcomes, str):
                         outcomes = orjson.loads(outcomes)
+                    
                     token_ids = m.get("clobTokenIds", [])
                     if isinstance(token_ids, str):
                         token_ids = orjson.loads(token_ids)
+                    
                     if token_ids:
                         result.append({
                             "title": m.get("question", ""),
                             "outcomes": outcomes,
                             "token_ids": token_ids,
                         })
+                
                 return result
         except Exception as e:
             logger.warning(f"Error fetching token IDs for {slug}: {e}")
             return []
 
 
-class PolymarketConsumer:
-    """Consumes Polymarket websocket streams with auto-discovery."""
+class PolymarketConsumer(BaseConsumer):
+    """
+    Consumes Polymarket websocket streams with auto-discovery.
+    
+    Features:
+    - Auto-discovers hourly markets based on Eastern Time
+    - Pre-fetches next hour's token IDs before UTC hour boundary
+    - Reconnects when market changes
+    
+    Emits rows with:
+    - event_type: "bbo" or "trade"
+    - Strict schema fields per event type
+    """
     
     def __init__(
         self,
         market_slug: str,
         on_row: Callable[[dict], None],
-        on_market_change: Optional[Callable[[str, List[str]], None]] = None,
     ):
-        self.market_slug = market_slug
-        self.on_row = on_row
-        self.on_market_change = on_market_change
+        super().__init__(on_row)
         
+        self.market_slug = market_slug
+        
+        # Token tracking
         self._token_ids: List[str] = []
         self._token_ids_set: set = set()
         self._labels: Dict[str, str] = {}
+        
+        # BBO state per token
         self._best: Dict[str, List[float]] = {}  # [bid_px, bid_sz, ask_px, ask_sz]
+        
+        # Sequence counters per (token_id, event_type)
         self._seq: Dict[str, int] = {}
         
-        self._running = False
-        self._backoff_seconds = 1.0
-        self._max_backoff = 60.0
+        # Current market URL
         self._current_market_url: Optional[str] = None
-        self._last_message_time: Optional[float] = None  # Track last data message (not ping/pong)
-        self._data_timeout_seconds = 300.0  # 5 minutes - reconnect if no data for this long
+        self._connection_market_url: Optional[str] = None
+        
+        # Discovery task
+        self._discovery_task: Optional[asyncio.Task] = None
+    
+    def _get_ws_url(self) -> str:
+        return WS_URL
+    
+    async def _on_connect(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """Subscribe to current market's tokens."""
+        if self._token_ids:
+            await ws.send(orjson.dumps({
+                "type": "market",
+                "assets_ids": self._token_ids,
+            }))
+            logger.info(
+                f"Polymarket: Subscribed to {len(self._token_ids)} tokens "
+                f"for {self.market_slug} (market: {self._current_market_url})"
+            )
+        self._connection_market_url = self._current_market_url
+    
+    def _get_name(self) -> str:
+        return f"Polymarket({self.market_slug})"
     
     async def _discover_current_market(self) -> Optional[str]:
         """Discover the current market URL based on Eastern time."""
         et_time = get_eastern_time()
-        market_url = derive_market_url(self.market_slug, et_time)
-        return market_url
+        return derive_market_url(self.market_slug, et_time)
     
     async def _update_token_ids(self, market_url: str) -> bool:
-        """Fetch and update token IDs for a market. Returns True if successful."""
+        """Fetch and update token IDs for a market."""
         slug = parse_polymarket_url(market_url)
         if not slug:
             logger.warning(f"Failed to parse slug from URL: {market_url}")
             return False
         
-        logger.info(f"Fetching token IDs for slug: {slug}")
+        logger.info(f"Polymarket: Fetching token IDs for slug: {slug}")
         markets = await fetch_token_ids(slug)
+        
         if not markets:
             logger.warning(f"No markets found for slug: {slug}")
             return False
@@ -156,7 +188,6 @@ class PolymarketConsumer:
         outcomes = m.get("outcomes", [])
         
         if set(new_token_ids) != self._token_ids_set:
-            # Token IDs changed, update
             self._token_ids = new_token_ids
             self._token_ids_set = set(new_token_ids)
             self._labels = {
@@ -164,326 +195,268 @@ class PolymarketConsumer:
                 for i, tid in enumerate(new_token_ids)
             }
             self._best = {tid: [0.0, 0.0, 0.0, 0.0] for tid in new_token_ids}
-            self._seq = {
-                f"{tid}_bbo": 0 for tid in new_token_ids
-            } | {
-                f"{tid}_trade": 0 for tid in new_token_ids
-            }
-            
-            if self.on_market_change:
-                self.on_market_change(market_url, new_token_ids)
-            
+            self._seq = {}  # Reset sequences for new tokens
             return True
         
         return False
     
-    def _normalize_row(self, token_id: str, event_type: str, recv_ts_ms: int, **kwargs) -> dict:
-        """Normalize Polymarket event to standard row format."""
-        seq_key = f"{token_id}_{event_type}"
-        self._seq[seq_key] = self._seq.get(seq_key, 0) + 1
-        seq = self._seq[seq_key]
+    async def _hourly_discovery_task(self, shutdown_event: asyncio.Event) -> None:
+        """Background task to discover and pre-fetch hourly markets."""
+        from ..time.boundaries import get_next_hour_boundary_utc, seconds_until_next_hour
         
-        row = {
-            "ts_event": kwargs.get("exch_ts", recv_ts_ms),
-            "ts_recv": recv_ts_ms,
-            "venue": "polymarket",
-            "stream_id": self.market_slug,  # Use market slug as stream_id
-            "seq": seq,
-            "event_type": event_type,
-            "token_id": token_id[:20] + "..." if len(token_id) > 20 else token_id,
-        }
-        
-        if event_type == "bbo":
-            row.update({
-                "bid_px": kwargs["bid_px"],
-                "bid_sz": kwargs["bid_sz"],
-                "ask_px": kwargs["ask_px"],
-                "ask_sz": kwargs["ask_sz"],
-            })
-        elif event_type == "trade":
-            row.update({
-                "price": kwargs["price"],
-                "size": kwargs["size"],
-                "side": kwargs.get("side", "unknown"),
-            })
-        
-        return row
-    
-    def _bbo(self, token_id: str, recv_ts_ms: int, bid_px: float, bid_sz: float, ask_px: float, ask_sz: float, exch_ts: Optional[int] = None):
-        """Handle BBO update."""
-        if token_id not in self._token_ids_set:
-            return
-        
-        old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
-        if bid_px == old[0] and bid_sz == old[1] and ask_px == old[2] and ask_sz == old[3]:
-            return  # No change
-        
-        self._best[token_id] = [bid_px, bid_sz, ask_px, ask_sz]
-        
-        row = self._normalize_row(
-            token_id, "bbo", recv_ts_ms,
-            bid_px=bid_px, bid_sz=bid_sz, ask_px=ask_px, ask_sz=ask_sz,
-            exch_ts=exch_ts or recv_ts_ms,
-        )
-        self.on_row(row)
-    
-    def _trade(self, token_id: str, recv_ts_ms: int, price: float, size: float, side: str, exch_ts: Optional[int] = None):
-        """Handle trade event."""
-        if token_id not in self._token_ids_set:
-            return
-        
-        row = self._normalize_row(
-            token_id, "trade", recv_ts_ms,
-            price=price, size=size, side=side.lower() if side else "unknown",
-            exch_ts=exch_ts or recv_ts_ms,
-        )
-        self.on_row(row)
-    
-    def _process(self, data: dict, recv_ts_ms: int):
-        """Process a websocket message."""
-        event_type = data.get("event_type", "")
-        ts = data.get("timestamp")
-        exch_ts = int(ts) if ts else None
-        
-        if event_type == "book":
-            token_id = data.get("asset_id", "")
-            if token_id not in self._token_ids_set:
-                return
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            if bids and asks:
-                bb = bids[-1]
-                ba = asks[-1]
-                self._bbo(
-                    token_id, recv_ts_ms,
-                    float(bb["price"]), float(bb["size"]),
-                    float(ba["price"]), float(ba["size"]),
-                    exch_ts,
-                )
-        
-        elif event_type == "price_change":
-            changes = data.get("price_changes", [])
-            if not changes:
-                return
-            by_asset = {}
-            for c in changes:
-                token_id = c.get("asset_id", "")
-                if token_id not in self._token_ids_set:
-                    continue
-                if token_id not in by_asset:
-                    by_asset[token_id] = {
-                        "bb": c.get("best_bid"),
-                        "ba": c.get("best_ask"),
-                        "lvl": {},
-                    }
-                p, s, side = c.get("price"), c.get("size"), c.get("side", "").upper()
-                if p and s is not None:
-                    by_asset[token_id]["lvl"][(side, p)] = float(s)
+        while self._running:
+            if shutdown_event.is_set():
+                break
             
-            for token_id, info in by_asset.items():
-                old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
-                bb_px = float(info["bb"]) if info["bb"] else old[0]
-                ba_px = float(info["ba"]) if info["ba"] else old[2]
-                bb_sz = info["lvl"].get(("BUY", info["bb"]), old[1] if bb_px == old[0] else 0.0)
-                ba_sz = info["lvl"].get(("SELL", info["ba"]), old[3] if ba_px == old[2] else 0.0)
-                self._bbo(token_id, recv_ts_ms, bb_px, bb_sz, ba_px, ba_sz, exch_ts)
-        
-        elif event_type == "last_trade_price":
-            token_id = data.get("asset_id", "")
-            if token_id not in self._token_ids_set:
-                return
-            p, s = data.get("price"), data.get("size")
-            if p is not None and s is not None:
-                self._trade(token_id, recv_ts_ms, float(p), float(s), data.get("side", ""), exch_ts)
-        
-        elif event_type == "best_bid_ask":
-            token_id = data.get("asset_id", "")
-            if token_id not in self._token_ids_set:
-                return
-            bb = data.get("best_bid")
-            ba = data.get("best_ask")
-            if bb is not None and ba is not None:
-                old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
-                self._bbo(token_id, recv_ts_ms, float(bb), old[1], float(ba), old[3], exch_ts)
-    
-    def _handle(self, raw: bytes, recv_ts_ms: int):
-        """Handle incoming websocket message."""
-        data = orjson.loads(raw)
-        if isinstance(data, list):
-            for item in data:
-                self._process(item, recv_ts_ms)
-        else:
-            self._process(data, recv_ts_ms)
-    
-    async def run(self, shutdown_event: Optional[asyncio.Event] = None) -> None:
-        """Run the consumer with auto-discovery and reconnection."""
-        self._running = True
-        
-        # Initial market discovery
-        current_market_url = await self._discover_current_market()
-        if not current_market_url:
-            logger.error("Failed to discover initial Polymarket market")
-            return
-        
-        await self._update_token_ids(current_market_url)
-        self._current_market_url = current_market_url
-        
-        # Hourly market discovery task - fetch next market 1 minute before UTC hour boundary
-        async def _hourly_discovery():
-            from ..time.boundaries import get_next_hour_boundary_utc, seconds_until_next_hour
-            
-            while self._running:
-                if shutdown_event and shutdown_event.is_set():
-                    break
+            try:
+                # Wait until 1 minute before next UTC hour
+                seconds_to_next = seconds_until_next_hour()
+                wait_time = max(0, seconds_to_next - 60.0)
                 
-                # Calculate time until next UTC hour boundary
-                next_utc_hour = get_next_hour_boundary_utc()
-                now_utc = datetime.now(timezone.utc)
-                seconds_to_next_hour = (next_utc_hour - now_utc).total_seconds()
-                
-                # Wait until 1 minute before the UTC hour boundary
-                wait_time = max(0, seconds_to_next_hour - 60.0)
                 if wait_time > 0:
                     await asyncio.sleep(wait_time)
                 
-                if shutdown_event and shutdown_event.is_set():
+                if shutdown_event.is_set() or not self._running:
                     break
                 
-                # Calculate what ET time will be at the next UTC hour boundary
-                # Convert next UTC hour to ET
-                next_utc_hour_actual = get_next_hour_boundary_utc()
-                # Convert UTC to ET (ET is UTC-5 or UTC-4, we use UTC-5 for simplicity)
+                # Pre-fetch next hour's market
+                next_utc_hour = get_next_hour_boundary_utc()
                 et_tz = timezone(timedelta(hours=-5))
-                next_et_time = next_utc_hour_actual.astimezone(et_tz)
-                
-                # Derive market URL for that ET hour
+                next_et_time = next_utc_hour.astimezone(et_tz)
                 next_market_url = derive_market_url(self.market_slug, next_et_time)
                 
                 if next_market_url != self._current_market_url:
-                    logger.info(f"Polymarket fetching token IDs for next hour: {next_market_url}")
-                    # Fetch token IDs for the next hour's market (pre-fetch at XX:59)
+                    logger.info(f"Polymarket: Pre-fetching tokens for next hour: {next_market_url}")
                     await self._update_token_ids(next_market_url)
                 
-                # Wait the remaining ~1 minute until UTC hour boundary
+                # Wait until hour boundary
                 remaining = seconds_until_next_hour()
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 
-                # At XX:00:00 UTC, switch to the new market
-                if shutdown_event and shutdown_event.is_set():
+                if shutdown_event.is_set() or not self._running:
                     break
                 
-                # Re-calculate to get the actual current market (in case timing drifted)
+                # Switch to new market
                 current_et_time = get_eastern_time()
                 actual_market_url = derive_market_url(self.market_slug, current_et_time)
                 
                 if actual_market_url != self._current_market_url:
-                    logger.info(f"Polymarket market switched at hour boundary: {self._current_market_url} -> {actual_market_url}")
+                    logger.info(
+                        f"Polymarket: Market switched: "
+                        f"{self._current_market_url} -> {actual_market_url}"
+                    )
                     self._current_market_url = actual_market_url
-                    # Token IDs should already be updated, but ensure they are
                     await self._update_token_ids(actual_market_url)
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Polymarket: Discovery error: {e}")
+                await asyncio.sleep(60)
+    
+    async def run(self, shutdown_event: Optional[asyncio.Event] = None) -> None:
+        """Run with hourly market discovery."""
+        # Initial discovery
+        self._current_market_url = await self._discover_current_market()
+        if self._current_market_url:
+            await self._update_token_ids(self._current_market_url)
         
-        # Track expected market URL for current connection
-        connection_market_url = None
+        if not self._token_ids:
+            logger.error("Polymarket: Failed to get initial token IDs")
+            return
         
-        discovery_task = asyncio.create_task(_hourly_discovery())
+        # Start discovery task
+        if shutdown_event:
+            self._discovery_task = asyncio.create_task(
+                self._hourly_discovery_task(shutdown_event)
+            )
         
         try:
-            while self._running:
-                if shutdown_event and shutdown_event.is_set():
-                    break
-                
-                # Check if market has changed - if so, we need to reconnect with new token IDs
-                if self._current_market_url and self._current_market_url != connection_market_url:
-                    logger.info(f"Market changed, will reconnect: {connection_market_url} -> {self._current_market_url}")
-                    connection_market_url = None  # Force reconnect
-                
-                if not self._token_ids:
-                    logger.warning("No token IDs available, waiting...")
-                    await asyncio.sleep(5)
-                    await self._update_token_ids(self._current_market_url)
-                    continue
-                
-                # Update connection market URL
-                connection_market_url = self._current_market_url
-                
-                try:
-                    async with websockets.connect(
-                        WS_URL,
-                        ping_interval=20,
-                        ping_timeout=60,
-                        max_size=2**20,
-                        compression=None,
-                    ) as ws:
-                        await ws.send(orjson.dumps({"type": "market", "assets_ids": self._token_ids}))
-                        logger.info(f"Polymarket connected: {len(self._token_ids)} tokens for {self.market_slug} (market: {self._current_market_url})")
-                        self._backoff_seconds = 1.0
-                        self._last_message_time = time_ns() / 1_000_000_000  # Reset on connection
-                        
-                        # Start a watchdog task to detect stale connections
-                        async def _watchdog():
-                            while self._running and not shutdown_event.is_set():
-                                await asyncio.sleep(30)  # Check every 30 seconds
-                                # Check if market changed (need to reconnect)
-                                if self._current_market_url != connection_market_url:
-                                    await ws.close()
-                                    break
-                                if self._last_message_time is None:
-                                    continue
-                                now = time_ns() / 1_000_000_000
-                                elapsed = now - self._last_message_time
-                                if elapsed > self._data_timeout_seconds:
-                                    logger.warning(f"No Polymarket data received for {elapsed:.0f}s, reconnecting...")
-                                    await ws.close()
-                                    break
-                        
-                        watchdog_task = asyncio.create_task(_watchdog())
-                        
-                        try:
-                            async for msg in ws:
-                                # Check if market changed during connection (force reconnect)
-                                if self._current_market_url != connection_market_url:
-                                    break
-                                
-                                # Update last message time on any data received
-                                self._last_message_time = time_ns() / 1_000_000_000
-                                
-                                if shutdown_event and shutdown_event.is_set():
-                                    break
-                                if not self._running:
-                                    break
-                                try:
-                                    self._handle(msg, time_ns() // 1_000_000)
-                                except Exception as e:
-                                    logger.warning(f"Error handling Polymarket message: {e}")
-                                    continue
-                        finally:
-                            watchdog_task.cancel()
-                            try:
-                                await watchdog_task
-                            except asyncio.CancelledError:
-                                pass
-                
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.warning(f"Polymarket connection error: {e}, reconnecting in {self._backoff_seconds:.1f}s")
-                
-                if shutdown_event and shutdown_event.is_set():
-                    break
-                if not self._running:
-                    break
-                
-                await asyncio.sleep(self._backoff_seconds)
-                self._backoff_seconds = min(self._backoff_seconds * 2, self._max_backoff)
-        
+            await super().run(shutdown_event)
         finally:
-            discovery_task.cancel()
-            try:
-                await discovery_task
-            except asyncio.CancelledError:
-                pass
+            if self._discovery_task:
+                self._discovery_task.cancel()
+                try:
+                    await self._discovery_task
+                except asyncio.CancelledError:
+                    pass
     
-    def stop(self):
-        """Stop the consumer."""
-        self._running = False
+    def _handle_message(self, raw: bytes, recv_ts_ms: int) -> None:
+        """Parse and normalize Polymarket message."""
+        data = orjson.loads(raw)
+        
+        if isinstance(data, list):
+            for item in data:
+                self._process_event(item, recv_ts_ms)
+        else:
+            self._process_event(data, recv_ts_ms)
+    
+    def _process_event(self, data: dict, recv_ts_ms: int) -> None:
+        """Process a single Polymarket event."""
+        event_type = data.get("event_type", "")
+        ts = data.get("timestamp")
+        exch_ts = int(ts) if ts else recv_ts_ms
+        
+        if event_type == "book":
+            self._handle_book(data, recv_ts_ms, exch_ts)
+        elif event_type == "price_change":
+            self._handle_price_change(data, recv_ts_ms, exch_ts)
+        elif event_type == "last_trade_price":
+            self._handle_trade(data, recv_ts_ms, exch_ts)
+        elif event_type == "best_bid_ask":
+            self._handle_best_bid_ask(data, recv_ts_ms, exch_ts)
+    
+    def _get_seq(self, token_id: str, event_type: str) -> int:
+        """Get and increment sequence number."""
+        key = f"{token_id}_{event_type}"
+        self._seq[key] = self._seq.get(key, 0) + 1
+        return self._seq[key]
+    
+    def _truncate_token_id(self, token_id: str) -> str:
+        """Truncate long token IDs for readability."""
+        if len(token_id) > 20:
+            return token_id[:20] + "..."
+        return token_id
+    
+    def _emit_bbo(
+        self,
+        token_id: str,
+        recv_ts_ms: int,
+        exch_ts: int,
+        bid_px: float,
+        bid_sz: float,
+        ask_px: float,
+        ask_sz: float,
+    ) -> None:
+        """Emit BBO row if changed."""
+        if token_id not in self._token_ids_set:
+            return
+        
+        # Check for change
+        old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
+        if (bid_px == old[0] and bid_sz == old[1] and 
+            ask_px == old[2] and ask_sz == old[3]):
+            return
+        
+        self._best[token_id] = [bid_px, bid_sz, ask_px, ask_sz]
+        
+        row = {
+            "venue": "polymarket",
+            "stream_id": self.market_slug,
+            "event_type": "bbo",
+            "ts_event": exch_ts,
+            "ts_recv": recv_ts_ms,
+            "seq": self._get_seq(token_id, "bbo"),
+            "bid_px": bid_px,
+            "bid_sz": bid_sz,
+            "ask_px": ask_px,
+            "ask_sz": ask_sz,
+            "token_id": self._truncate_token_id(token_id),
+        }
+        self._emit_row(row)
+    
+    def _emit_trade(
+        self,
+        token_id: str,
+        recv_ts_ms: int,
+        exch_ts: int,
+        price: float,
+        size: float,
+        side: str,
+    ) -> None:
+        """Emit trade row."""
+        if token_id not in self._token_ids_set:
+            return
+        
+        row = {
+            "venue": "polymarket",
+            "stream_id": self.market_slug,
+            "event_type": "trade",
+            "ts_event": exch_ts,
+            "ts_recv": recv_ts_ms,
+            "seq": self._get_seq(token_id, "trade"),
+            "price": price,
+            "size": size,
+            "side": side.lower() if side else "unknown",
+            "token_id": self._truncate_token_id(token_id),
+        }
+        self._emit_row(row)
+    
+    def _handle_book(self, data: dict, recv_ts_ms: int, exch_ts: int) -> None:
+        """Handle book snapshot."""
+        token_id = data.get("asset_id", "")
+        if token_id not in self._token_ids_set:
+            return
+        
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        
+        if bids and asks:
+            bb = bids[-1]
+            ba = asks[-1]
+            self._emit_bbo(
+                token_id, recv_ts_ms, exch_ts,
+                float(bb["price"]), float(bb["size"]),
+                float(ba["price"]), float(ba["size"]),
+            )
+    
+    def _handle_price_change(self, data: dict, recv_ts_ms: int, exch_ts: int) -> None:
+        """Handle price change event."""
+        changes = data.get("price_changes", [])
+        if not changes:
+            return
+        
+        by_asset = {}
+        for c in changes:
+            token_id = c.get("asset_id", "")
+            if token_id not in self._token_ids_set:
+                continue
+            
+            if token_id not in by_asset:
+                by_asset[token_id] = {
+                    "bb": c.get("best_bid"),
+                    "ba": c.get("best_ask"),
+                    "lvl": {},
+                }
+            
+            p, s, side = c.get("price"), c.get("size"), c.get("side", "").upper()
+            if p and s is not None:
+                by_asset[token_id]["lvl"][(side, p)] = float(s)
+        
+        for token_id, info in by_asset.items():
+            old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
+            bb_px = float(info["bb"]) if info["bb"] else old[0]
+            ba_px = float(info["ba"]) if info["ba"] else old[2]
+            bb_sz = info["lvl"].get(("BUY", info["bb"]), old[1] if bb_px == old[0] else 0.0)
+            ba_sz = info["lvl"].get(("SELL", info["ba"]), old[3] if ba_px == old[2] else 0.0)
+            self._emit_bbo(token_id, recv_ts_ms, exch_ts, bb_px, bb_sz, ba_px, ba_sz)
+    
+    def _handle_trade(self, data: dict, recv_ts_ms: int, exch_ts: int) -> None:
+        """Handle trade event."""
+        token_id = data.get("asset_id", "")
+        if token_id not in self._token_ids_set:
+            return
+        
+        p, s = data.get("price"), data.get("size")
+        if p is not None and s is not None:
+            self._emit_trade(
+                token_id, recv_ts_ms, exch_ts,
+                float(p), float(s), data.get("side", ""),
+            )
+    
+    def _handle_best_bid_ask(self, data: dict, recv_ts_ms: int, exch_ts: int) -> None:
+        """Handle best bid/ask update."""
+        token_id = data.get("asset_id", "")
+        if token_id not in self._token_ids_set:
+            return
+        
+        bb = data.get("best_bid")
+        ba = data.get("best_ask")
+        
+        if bb is not None and ba is not None:
+            old = self._best.get(token_id, [0.0, 0.0, 0.0, 0.0])
+            self._emit_bbo(
+                token_id, recv_ts_ms, exch_ts,
+                float(bb), old[1], float(ba), old[3],
+            )
