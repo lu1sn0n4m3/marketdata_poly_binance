@@ -383,16 +383,62 @@ class PolymarketConsumer(BaseConsumer):
         }
         self._emit_row(row)
     
+    def _emit_book(
+        self,
+        token_id: str,
+        recv_ts_ms: int,
+        exch_ts: int,
+        bids: list,
+        asks: list,
+        book_hash: str,
+    ) -> None:
+        """Emit full order book snapshot."""
+        if token_id not in self._token_ids_set:
+            return
+        
+        # Polymarket sends best bid/ask LAST in arrays
+        # We want best FIRST, so reverse them
+        # bids: best = highest price (reverse to get descending)
+        # asks: best = lowest price (reverse to get ascending)
+        bid_prices = [float(b["price"]) for b in reversed(bids)]
+        bid_sizes = [float(b["size"]) for b in reversed(bids)]
+        ask_prices = [float(a["price"]) for a in reversed(asks)]
+        ask_sizes = [float(a["size"]) for a in reversed(asks)]
+        
+        row = {
+            "venue": "polymarket",
+            "stream_id": self.market_slug,
+            "event_type": "book",
+            "ts_event": exch_ts,
+            "ts_recv": recv_ts_ms,
+            "seq": self._get_seq(token_id, "book"),
+            "token_id": self._truncate_token_id(token_id),
+            "bid_prices": bid_prices,
+            "bid_sizes": bid_sizes,
+            "ask_prices": ask_prices,
+            "ask_sizes": ask_sizes,
+            "book_hash": book_hash,
+        }
+        self._emit_row(row)
+    
     def _handle_book(self, data: dict, recv_ts_ms: int, exch_ts: int) -> None:
-        """Handle book snapshot."""
+        """Handle book snapshot - emit both full book and BBO."""
         token_id = data.get("asset_id", "")
         if token_id not in self._token_ids_set:
             return
         
         bids = data.get("bids", [])
         asks = data.get("asks", [])
+        book_hash = data.get("hash", "")
         
         if bids and asks:
+            # Emit full book snapshot
+            self._emit_book(
+                token_id, recv_ts_ms, exch_ts,
+                bids, asks, book_hash,
+            )
+            
+            # Also emit BBO update (best bid/ask are LAST in arrays)
             bb = bids[-1]
             ba = asks[-1]
             self._emit_bbo(

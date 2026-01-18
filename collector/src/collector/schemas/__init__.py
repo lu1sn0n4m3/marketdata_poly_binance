@@ -10,6 +10,7 @@ from typing import Dict, Tuple
 import pyarrow as pa
 
 from .bbo import BBO_SCHEMA_BINANCE, BBO_SCHEMA_POLYMARKET
+from .book import BOOK_SCHEMA_POLYMARKET
 from .trade import TRADE_SCHEMA_BINANCE, TRADE_SCHEMA_POLYMARKET
 from .manifest import Manifest
 
@@ -19,6 +20,7 @@ SCHEMAS: Dict[Tuple[str, str], pa.Schema] = {
     ("binance", "trade"): TRADE_SCHEMA_BINANCE,
     ("polymarket", "bbo"): BBO_SCHEMA_POLYMARKET,
     ("polymarket", "trade"): TRADE_SCHEMA_POLYMARKET,
+    ("polymarket", "book"): BOOK_SCHEMA_POLYMARKET,
 }
 
 
@@ -56,6 +58,7 @@ __all__ = [
     "Manifest",
     "BBO_SCHEMA_BINANCE",
     "BBO_SCHEMA_POLYMARKET",
+    "BOOK_SCHEMA_POLYMARKET",
     "TRADE_SCHEMA_BINANCE",
     "TRADE_SCHEMA_POLYMARKET",
 ]
