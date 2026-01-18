@@ -53,6 +53,7 @@ class Uploader:
         self._shutdown_event = asyncio.Event()
         self._last_hourly_log = -1
         self._last_daily_summary_day = -1
+        self._last_status_hour = -1  # For 12-hour status updates
         self._daily_uploads = 0
         self._daily_bytes = 0
         self._daily_failures = 0
@@ -198,29 +199,39 @@ class Uploader:
                 f"disk_free={free_pct:.1f}%"
             )
     
-    def _maybe_send_daily_summary(self) -> None:
-        """Send daily summary at midnight UTC."""
+    def _maybe_send_status_update(self) -> None:
+        """Send status update every 12 hours (at 08:00 and 20:00 UTC)."""
         now = datetime.now(timezone.utc)
-        current_day = now.day
+        current_hour = now.hour
         
-        # Send at first cycle after midnight
-        if current_day != self._last_daily_summary_day and now.hour == 0:
-            self._last_daily_summary_day = current_day
+        # Send at 08:00 and 20:00 UTC (more reasonable hours)
+        if current_hour in (8, 20) and current_hour != self._last_status_hour:
+            self._last_status_hour = current_hour
             
             backlog = count_backlog(self.config.final_dir, self.config.uploaded_dir)
+            free_pct = self.health.get_free_disk_percent(self.config.data_dir)
             
             if self.notifier:
-                self.notifier.send_daily_summary(
-                    self._daily_uploads,
-                    self._daily_bytes,
-                    backlog,
-                    self._daily_failures,
-                )
-            
-            # Reset daily counters
-            self._daily_uploads = 0
-            self._daily_bytes = 0
-            self._daily_failures = 0
+                # At 08:00, send full daily summary and reset counters
+                if current_hour == 8:
+                    self.notifier.send_daily_summary(
+                        self._daily_uploads,
+                        self._daily_bytes,
+                        backlog,
+                        self._daily_failures,
+                    )
+                    # Reset daily counters
+                    self._daily_uploads = 0
+                    self._daily_bytes = 0
+                    self._daily_failures = 0
+                else:
+                    # At 20:00, send a shorter status update
+                    self.notifier.send_status_update(
+                        self._daily_uploads,
+                        self._daily_bytes,
+                        backlog,
+                        free_pct,
+                    )
     
     def _check_disk_pressure(self) -> None:
         """Check disk space and warn if low."""
@@ -259,8 +270,17 @@ class Uploader:
         if self.notifier:
             self.notifier.send_startup()
         
-        # Initialize daily summary day
-        self._last_daily_summary_day = datetime.now(timezone.utc).day
+        # Initialize status hour
+        self._last_status_hour = -1
+        
+        # Set up status callback for /status command
+        if self.notifier:
+            self.notifier.set_status_callback(self._get_status_for_command)
+        
+        # Start command polling task
+        command_task = None
+        if self.notifier:
+            command_task = asyncio.create_task(self.notifier.poll_commands())
         
         # Main loop
         while not self._shutdown_event.is_set():
@@ -274,7 +294,7 @@ class Uploader:
                 
                 # Periodic tasks
                 self._maybe_log_hourly()
-                self._maybe_send_daily_summary()
+                self._maybe_send_status_update()
                 self._check_disk_pressure()
                 
                 # Sleep until next cycle
@@ -286,7 +306,48 @@ class Uploader:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(self.config.scan_interval_seconds)
         
+        # Cancel command polling
+        if command_task:
+            command_task.cancel()
+            try:
+                await command_task
+            except asyncio.CancelledError:
+                pass
+        
         logger.info("Uploader stopped")
+    
+    def _get_status_for_command(self) -> dict:
+        """Get current status for /status command."""
+        import json
+        
+        # Read collector health
+        collector_health_file = self.config.state_dir / "health" / "collector.json"
+        collector_status = {"healthy": False, "uptime_hours": 0, "active_streams": 0}
+        
+        try:
+            if collector_health_file.exists():
+                with open(collector_health_file) as f:
+                    data = json.load(f)
+                collector_status["healthy"] = True
+                collector_status["uptime_hours"] = data.get("uptime_seconds", 0) / 3600
+                collector_status["active_streams"] = data.get("active_streams", 0)
+        except Exception:
+            pass
+        
+        # Uploader status
+        backlog = count_backlog(self.config.final_dir, self.config.uploaded_dir)
+        uploader_status = {
+            "healthy": True,
+            "uploads_today": self._daily_uploads,
+            "backlog": backlog,
+            "failures_today": self._daily_failures,
+        }
+        
+        return {
+            "collector": collector_status,
+            "uploader": uploader_status,
+            "disk_free_percent": self.health.get_free_disk_percent(self.config.data_dir),
+        }
 
 
 async def _main_async() -> None:
