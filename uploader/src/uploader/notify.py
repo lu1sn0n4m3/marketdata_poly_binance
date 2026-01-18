@@ -94,10 +94,43 @@ class TelegramNotifier:
             else:
                 return "❌ Status not available"
         
+        elif text in ("/markets", "markets", "/m"):
+            if self._status_callback:
+                try:
+                    status = self._status_callback()
+                    return self._format_markets_response(status)
+                except Exception as e:
+                    return f"❌ Error getting markets: {e}"
+            else:
+                return "❌ Markets not available"
+        
+        elif text in ("/streams", "streams"):
+            if self._status_callback:
+                try:
+                    status = self._status_callback()
+                    return self._format_streams_response(status)
+                except Exception as e:
+                    return f"❌ Error getting streams: {e}"
+            else:
+                return "❌ Streams not available"
+        
+        elif text in ("/backlog", "backlog", "/b"):
+            if self._status_callback:
+                try:
+                    status = self._status_callback()
+                    return self._format_backlog_response(status)
+                except Exception as e:
+                    return f"❌ Error getting backlog: {e}"
+            else:
+                return "❌ Backlog not available"
+        
         elif text in ("/help", "help", "/h"):
             return (
                 "📖 <b>Available Commands</b>\n\n"
-                "/status - Current system status\n"
+                "/status - System overview\n"
+                "/markets - Subscribed markets\n"
+                "/streams - Active data streams\n"
+                "/backlog - Upload backlog details\n"
                 "/help - Show this help"
             )
         
@@ -112,6 +145,11 @@ class TelegramNotifier:
         collector_emoji = "🟢" if collector.get("healthy", False) else "🔴"
         collector_uptime = collector.get("uptime_hours", 0)
         collector_streams = collector.get("active_streams", 0)
+        
+        # Subscriptions
+        subs = collector.get("subscriptions", {})
+        binance_count = len(subs.get("binance", []))
+        polymarket_count = len(subs.get("polymarket", []))
         
         # Uploader status
         uploader = status.get("uploader", {})
@@ -134,13 +172,89 @@ class TelegramNotifier:
             f"<i>{now}</i>\n\n"
             f"{collector_emoji} <b>Collector</b>\n"
             f"   Uptime: {collector_uptime:.1f}h\n"
-            f"   Streams: {collector_streams}\n\n"
+            f"   Streams: {collector_streams}\n"
+            f"   Markets: {binance_count} Binance, {polymarket_count} Polymarket\n\n"
             f"{uploader_emoji} <b>Uploader</b>\n"
             f"   Uploads today: {uploads_today}\n"
             f"   Backlog: {backlog}\n"
             f"   Failures: {failures}\n\n"
-            f"{disk_emoji} <b>Disk</b>: {free_pct:.1f}% free"
+            f"{disk_emoji} <b>Disk</b>: {free_pct:.1f}% free\n\n"
+            f"<i>Use /markets for market details</i>"
         )
+    
+    def _format_markets_response(self, status: dict) -> str:
+        """Format subscribed markets as Telegram message."""
+        collector = status.get("collector", {})
+        subs = collector.get("subscriptions", {})
+        
+        binance = subs.get("binance", [])
+        polymarket = subs.get("polymarket", [])
+        
+        lines = ["📈 <b>Subscribed Markets</b>\n"]
+        
+        lines.append("\n<b>Binance</b>")
+        for symbol in binance:
+            lines.append(f"   • {symbol}")
+        
+        lines.append("\n<b>Polymarket</b>")
+        for slug in polymarket:
+            lines.append(f"   • {slug}")
+        
+        return "\n".join(lines)
+    
+    def _format_streams_response(self, status: dict) -> str:
+        """Format active streams as Telegram message."""
+        now = datetime.now(timezone.utc)
+        streams = status.get("streams", [])
+        
+        if not streams:
+            return "📡 <b>Active Streams</b>\n\nNo streams active"
+        
+        lines = ["📡 <b>Active Streams</b>\n"]
+        
+        for stream in streams:
+            venue = stream.get("venue", "?")
+            stream_id = stream.get("stream_id", "?")
+            last_ts = stream.get("last_event_ts_ms", 0)
+            
+            # Calculate age
+            if last_ts:
+                age_seconds = (now.timestamp() * 1000 - last_ts) / 1000
+                if age_seconds < 60:
+                    age_str = f"{age_seconds:.0f}s ago"
+                elif age_seconds < 3600:
+                    age_str = f"{age_seconds/60:.0f}m ago"
+                else:
+                    age_str = f"{age_seconds/3600:.1f}h ago"
+                
+                # Stale if > 5 minutes
+                emoji = "🟢" if age_seconds < 300 else "🟡"
+            else:
+                age_str = "unknown"
+                emoji = "🔴"
+            
+            lines.append(f"{emoji} <b>{venue}</b>/{stream_id}")
+            lines.append(f"   Last: {age_str}")
+        
+        return "\n".join(lines)
+    
+    def _format_backlog_response(self, status: dict) -> str:
+        """Format backlog details as Telegram message."""
+        uploader = status.get("uploader", {})
+        backlog = uploader.get("backlog", 0)
+        backlog_details = status.get("backlog_details", [])
+        
+        if backlog == 0:
+            return "📋 <b>Upload Backlog</b>\n\n✅ No pending uploads"
+        
+        lines = [f"📋 <b>Upload Backlog</b>\n\n📁 {backlog} partitions pending\n"]
+        
+        if backlog_details:
+            lines.append("<b>Recent:</b>")
+            for item in backlog_details[:5]:  # Show max 5
+                lines.append(f"   • {item}")
+        
+        return "\n".join(lines)
     
     async def poll_commands(self) -> None:
         """Poll for and handle incoming commands (run as background task)."""

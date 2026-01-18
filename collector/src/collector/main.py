@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-POLYMARKET_MARKET_SLUG = "bitcoin-up-or-down"
+POLYMARKET_MARKET_SLUGS = ["bitcoin-up-or-down", "ethereum-up-or-down"]
 DATA_DIR = Path(os.getenv("COLLECTOR_DATA_DIR", "./data"))
 
 
@@ -41,12 +41,16 @@ class Collector:
         self,
         data_dir: Path = DATA_DIR,
         binance_symbols: Optional[list[str]] = None,
-        polymarket_slug: str = POLYMARKET_MARKET_SLUG,
+        polymarket_slugs: Optional[list[str]] = None,
     ):
         self.data_dir = data_dir
         self.tmp_dir = data_dir / "tmp"
         self.final_dir = data_dir / "final"
         self.state_dir = data_dir / "state"
+        
+        # Store config for status reporting
+        self.binance_symbols = binance_symbols or BINANCE_SYMBOLS
+        self.polymarket_slugs = polymarket_slugs or POLYMARKET_MARKET_SLUGS
         
         # Create directories
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +60,7 @@ class Collector:
         # Initialize components
         self.buffer = StreamBuffer()
         self.heartbeat = HeartbeatWriter(self.state_dir)
+        self.heartbeat.set_subscriptions(self.binance_symbols, self.polymarket_slugs)
         
         # Finalization state tracking
         # Key: (venue, stream_id, event_type, date, hour)
@@ -65,13 +70,15 @@ class Collector:
         
         # Consumers
         self.binance_consumer = BinanceConsumer(
-            symbols=binance_symbols or BINANCE_SYMBOLS,
+            symbols=self.binance_symbols,
             on_row=self._on_row,
         )
-        self.polymarket_consumer = PolymarketConsumer(
-            market_slug=polymarket_slug,
-            on_row=self._on_row,
-        )
+        
+        # Create a Polymarket consumer for each market
+        self.polymarket_consumers = [
+            PolymarketConsumer(market_slug=slug, on_row=self._on_row)
+            for slug in self.polymarket_slugs
+        ]
         
         self._shutdown_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -313,8 +320,8 @@ class Collector:
         """Run the collector."""
         logger.info("Starting collector...")
         logger.info(f"Data directory: {self.data_dir}")
-        logger.info(f"Binance symbols: {BINANCE_SYMBOLS}")
-        logger.info(f"Polymarket market: {POLYMARKET_MARKET_SLUG}")
+        logger.info(f"Binance symbols: {self.binance_symbols}")
+        logger.info(f"Polymarket markets: {self.polymarket_slugs}")
         
         # Start heartbeat
         await self.heartbeat.start(interval_seconds=60.0)
@@ -322,10 +329,15 @@ class Collector:
         # Start all tasks
         self._tasks = [
             asyncio.create_task(self.binance_consumer.run(self._shutdown_event)),
-            asyncio.create_task(self.polymarket_consumer.run(self._shutdown_event)),
             asyncio.create_task(self._flush_task()),
             asyncio.create_task(self._finalization_task()),
         ]
+        
+        # Add a task for each Polymarket consumer
+        for consumer in self.polymarket_consumers:
+            self._tasks.append(
+                asyncio.create_task(consumer.run(self._shutdown_event))
+            )
         
         try:
             await self._shutdown_event.wait()
@@ -334,7 +346,8 @@ class Collector:
             
             # Stop consumers
             self.binance_consumer.stop()
-            self.polymarket_consumer.stop()
+            for consumer in self.polymarket_consumers:
+                consumer.stop()
             
             # Cancel all tasks
             for task in self._tasks:

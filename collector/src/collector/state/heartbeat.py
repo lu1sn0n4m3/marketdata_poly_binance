@@ -18,6 +18,15 @@ class HeartbeatWriter:
         self._start_time = datetime.now(timezone.utc)
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        
+        # Market subscriptions (set by collector)
+        self.binance_symbols: list[str] = []
+        self.polymarket_slugs: list[str] = []
+    
+    def set_subscriptions(self, binance_symbols: list[str], polymarket_slugs: list[str]):
+        """Set the market subscriptions for status reporting."""
+        self.binance_symbols = binance_symbols
+        self.polymarket_slugs = polymarket_slugs
     
     def update_stream(self, venue: str, stream_id: str, last_event_ts_ms: int):
         """Update last event timestamp for a stream."""
@@ -40,6 +49,10 @@ class HeartbeatWriter:
             "uptime_seconds": int(uptime),
             "current_hour": f"{date_str}T{hour:02d}:00:00Z",
             "active_streams": len(self._active_streams),
+            "subscriptions": {
+                "binance": self.binance_symbols,
+                "polymarket": self.polymarket_slugs,
+            },
             "streams": [
                 {
                     "venue": info["venue"],

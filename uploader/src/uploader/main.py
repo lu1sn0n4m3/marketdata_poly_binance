@@ -322,7 +322,13 @@ class Uploader:
         
         # Read collector health
         collector_health_file = self.config.state_dir / "health" / "collector.json"
-        collector_status = {"healthy": False, "uptime_hours": 0, "active_streams": 0}
+        collector_status = {
+            "healthy": False,
+            "uptime_hours": 0,
+            "active_streams": 0,
+            "subscriptions": {"binance": [], "polymarket": []},
+        }
+        streams = []
         
         try:
             if collector_health_file.exists():
@@ -331,6 +337,11 @@ class Uploader:
                 collector_status["healthy"] = True
                 collector_status["uptime_hours"] = data.get("uptime_seconds", 0) / 3600
                 collector_status["active_streams"] = data.get("active_streams", 0)
+                collector_status["subscriptions"] = data.get("subscriptions", {
+                    "binance": [],
+                    "polymarket": [],
+                })
+                streams = data.get("streams", [])
         except Exception:
             pass
         
@@ -343,9 +354,26 @@ class Uploader:
             "failures_today": self._daily_failures,
         }
         
+        # Get backlog details (first few pending partitions)
+        backlog_details = []
+        try:
+            from .scanner import scan_for_uploadable
+            for p in scan_for_uploadable(
+                self.config.final_dir,
+                self.config.uploaded_dir,
+                min_age_seconds=0,
+            ):
+                backlog_details.append(p.relative_path)
+                if len(backlog_details) >= 5:
+                    break
+        except Exception:
+            pass
+        
         return {
             "collector": collector_status,
             "uploader": uploader_status,
+            "streams": streams,
+            "backlog_details": backlog_details,
             "disk_free_percent": self.health.get_free_disk_percent(self.config.data_dir),
         }
 
