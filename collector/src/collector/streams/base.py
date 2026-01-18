@@ -93,6 +93,24 @@ class BaseConsumer(ABC):
         """Emit a normalized row to the callback."""
         self.on_row(row)
     
+    def _should_reconnect(self) -> bool:
+        """
+        Check if connection should be closed and reconnected.
+        
+        Subclasses can override this to signal reconnection needs
+        (e.g., when subscriptions change).
+        """
+        return False
+    
+    def _get_last_activity_time(self) -> Optional[float]:
+        """
+        Get the timestamp of last meaningful activity.
+        
+        Subclasses can override to check emit time instead of receive time.
+        Returns None if no activity yet.
+        """
+        return self._last_message_time
+    
     async def _watchdog(
         self,
         ws: websockets.WebSocketClientProtocol,
@@ -101,7 +119,9 @@ class BaseConsumer(ABC):
         """
         Watchdog task to detect stale connections.
         
-        Closes the websocket if no data received for too long.
+        Closes the websocket if no meaningful activity for too long.
+        Uses _get_last_activity_time() which subclasses can override
+        to check emit time instead of just receive time.
         """
         while self._running:
             if shutdown_event and shutdown_event.is_set():
@@ -109,15 +129,16 @@ class BaseConsumer(ABC):
             
             await asyncio.sleep(30)  # Check every 30 seconds
             
-            if self._last_message_time is None:
+            last_activity = self._get_last_activity_time()
+            if last_activity is None:
                 continue
             
             now = time_ns() / 1_000_000_000
-            elapsed = now - self._last_message_time
+            elapsed = now - last_activity
             
             if elapsed > self._data_timeout_seconds:
                 logger.warning(
-                    f"{self._get_name()}: No data for {elapsed:.0f}s, reconnecting..."
+                    f"{self._get_name()}: No activity for {elapsed:.0f}s, reconnecting..."
                 )
                 await ws.close()
                 break
@@ -167,6 +188,12 @@ class BaseConsumer(ABC):
                             if shutdown_event and shutdown_event.is_set():
                                 break
                             if not self._running:
+                                break
+                            
+                            # Check if subclass wants to reconnect
+                            if self._should_reconnect():
+                                logger.info(f"{self._get_name()}: Reconnecting (subscription change)")
+                                await ws.close()
                                 break
                             
                             try:

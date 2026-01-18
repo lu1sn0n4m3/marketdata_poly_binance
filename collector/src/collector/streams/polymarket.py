@@ -113,7 +113,7 @@ class PolymarketConsumer(BaseConsumer):
     - Reconnects when market changes
     
     Emits rows with:
-    - event_type: "bbo" or "trade"
+    - event_type: "bbo", "trade", or "book"
     - Strict schema fields per event type
     """
     
@@ -143,6 +143,17 @@ class PolymarketConsumer(BaseConsumer):
         
         # Discovery task
         self._discovery_task: Optional[asyncio.Task] = None
+        
+        # Reconnection flag - set by discovery task when tokens change
+        self._needs_reconnect: bool = False
+        
+        # Track last time we emitted data (for watchdog)
+        self._last_emit_time: Optional[float] = None
+        
+        # Pre-fetched tokens for next hour (staged, not applied yet)
+        self._pending_token_ids: Optional[List[str]] = None
+        self._pending_labels: Optional[Dict[str, str]] = None
+        self._pending_market_url: Optional[str] = None
     
     def _get_ws_url(self) -> str:
         return WS_URL
@@ -163,45 +174,165 @@ class PolymarketConsumer(BaseConsumer):
     def _get_name(self) -> str:
         return f"Polymarket({self.market_slug})"
     
+    def _emit_row(self, row: dict) -> None:
+        """Emit row and track last emit time."""
+        from time import time_ns
+        self._last_emit_time = time_ns() / 1_000_000_000
+        super()._emit_row(row)
+    
+    def _should_reconnect(self) -> bool:
+        """Check if we need to reconnect due to token change."""
+        if self._needs_reconnect:
+            self._needs_reconnect = False
+            return True
+        return False
+    
+    def _get_last_activity_time(self) -> Optional[float]:
+        """
+        Use emit time for watchdog, not just receive time.
+        
+        This catches the case where websocket is receiving data for
+        tokens we're filtering out (e.g., old market after hour change).
+        """
+        return self._last_emit_time
+    
     async def _discover_current_market(self) -> Optional[str]:
         """Discover the current market URL based on Eastern time."""
         et_time = get_eastern_time()
         return derive_market_url(self.market_slug, et_time)
     
-    async def _update_token_ids(self, market_url: str) -> bool:
-        """Fetch and update token IDs for a market."""
+    async def _fetch_token_ids(self, market_url: str) -> Optional[tuple]:
+        """
+        Fetch token IDs for a market WITHOUT applying them.
+        
+        Returns:
+            Tuple of (token_ids, labels) or None if failed.
+        """
         slug = parse_polymarket_url(market_url)
         if not slug:
             logger.warning(f"Failed to parse slug from URL: {market_url}")
-            return False
+            return None
         
-        logger.info(f"Polymarket: Fetching token IDs for slug: {slug}")
+        logger.debug(f"Polymarket: Fetching token IDs for slug: {slug}")
         markets = await fetch_token_ids(slug)
         
         if not markets:
             logger.warning(f"No markets found for slug: {slug}")
-            return False
+            return None
         
         # Use first market
         m = markets[0]
-        new_token_ids = m["token_ids"]
+        token_ids = m["token_ids"]
         outcomes = m.get("outcomes", [])
         
-        if set(new_token_ids) != self._token_ids_set:
-            self._token_ids = new_token_ids
-            self._token_ids_set = set(new_token_ids)
-            self._labels = {
-                tid: (outcomes[i] if i < len(outcomes) else f"T{i}")
-                for i, tid in enumerate(new_token_ids)
-            }
-            self._best = {tid: [0.0, 0.0, 0.0, 0.0] for tid in new_token_ids}
-            self._seq = {}  # Reset sequences for new tokens
+        labels = {
+            tid: (outcomes[i] if i < len(outcomes) else f"T{i}")
+            for i, tid in enumerate(token_ids)
+        }
+        
+        return (token_ids, labels)
+    
+    async def _prefetch_next_hour(self, market_url: str) -> bool:
+        """
+        Pre-fetch tokens for next hour WITHOUT applying them.
+        
+        Tokens are staged in _pending_* fields, ready to apply at hour boundary.
+        """
+        result = await self._fetch_token_ids(market_url)
+        if result is None:
+            return False
+        
+        token_ids, labels = result
+        
+        # Only stage if different from current
+        if set(token_ids) != self._token_ids_set:
+            self._pending_token_ids = token_ids
+            self._pending_labels = labels
+            self._pending_market_url = market_url
+            logger.info(
+                f"Polymarket: Pre-fetched {len(token_ids)} tokens for "
+                f"{self.market_slug} (next hour: {market_url})"
+            )
+            return True
+        
+        return False
+    
+    def _apply_pending_tokens(self) -> bool:
+        """
+        Apply pre-fetched tokens and trigger reconnection.
+        
+        Call this AT the hour boundary to switch to new market.
+        Returns True if tokens were applied.
+        """
+        if self._pending_token_ids is None:
+            return False
+        
+        old_market = self._current_market_url
+        
+        # Apply pending tokens
+        self._token_ids = self._pending_token_ids
+        self._token_ids_set = set(self._pending_token_ids)
+        self._labels = self._pending_labels or {}
+        self._current_market_url = self._pending_market_url
+        
+        # Reset state for new tokens
+        self._best = {tid: [0.0, 0.0, 0.0, 0.0] for tid in self._token_ids}
+        self._seq = {}
+        
+        # Clear pending
+        self._pending_token_ids = None
+        self._pending_labels = None
+        self._pending_market_url = None
+        
+        # Trigger reconnection
+        self._needs_reconnect = True
+        
+        logger.info(
+            f"Polymarket: Switched {self.market_slug}: "
+            f"{old_market} -> {self._current_market_url}, "
+            f"reconnecting to resubscribe"
+        )
+        
+        return True
+    
+    async def _update_token_ids(self, market_url: str) -> bool:
+        """
+        Fetch and immediately apply token IDs for a market.
+        
+        Used for INITIAL discovery only. For hourly changes, use
+        _prefetch_next_hour() + _apply_pending_tokens().
+        """
+        result = await self._fetch_token_ids(market_url)
+        if result is None:
+            return False
+        
+        token_ids, labels = result
+        
+        if set(token_ids) != self._token_ids_set:
+            self._token_ids = token_ids
+            self._token_ids_set = set(token_ids)
+            self._labels = labels
+            self._best = {tid: [0.0, 0.0, 0.0, 0.0] for tid in token_ids}
+            self._seq = {}
+            
+            logger.info(
+                f"Polymarket: Loaded {len(token_ids)} tokens for "
+                f"{self.market_slug} ({market_url})"
+            )
             return True
         
         return False
     
     async def _hourly_discovery_task(self, shutdown_event: asyncio.Event) -> None:
-        """Background task to discover and pre-fetch hourly markets."""
+        """
+        Background task to manage hourly market transitions.
+        
+        Key design:
+        - Keep collecting from CURRENT market until hour boundary
+        - Pre-fetch NEXT hour's tokens 1 minute before
+        - Switch to new tokens exactly AT the hour boundary
+        - This ensures we don't miss the final minutes of each hour
+        """
         from ..time.boundaries import get_next_hour_boundary_utc, seconds_until_next_hour
         
         while self._running:
@@ -219,17 +350,18 @@ class PolymarketConsumer(BaseConsumer):
                 if shutdown_event.is_set() or not self._running:
                     break
                 
-                # Pre-fetch next hour's market
+                # Pre-fetch next hour's tokens (staged, NOT applied yet)
+                # We continue collecting from current market during this time
                 next_utc_hour = get_next_hour_boundary_utc()
                 et_tz = timezone(timedelta(hours=-5))
                 next_et_time = next_utc_hour.astimezone(et_tz)
                 next_market_url = derive_market_url(self.market_slug, next_et_time)
                 
                 if next_market_url != self._current_market_url:
-                    logger.info(f"Polymarket: Pre-fetching tokens for next hour: {next_market_url}")
-                    await self._update_token_ids(next_market_url)
+                    await self._prefetch_next_hour(next_market_url)
                 
-                # Wait until hour boundary
+                # Wait until EXACTLY the hour boundary
+                # Continue collecting from current market until then
                 remaining = seconds_until_next_hour()
                 if remaining > 0:
                     await asyncio.sleep(remaining)
@@ -237,22 +369,35 @@ class PolymarketConsumer(BaseConsumer):
                 if shutdown_event.is_set() or not self._running:
                     break
                 
-                # Switch to new market
-                current_et_time = get_eastern_time()
-                actual_market_url = derive_market_url(self.market_slug, current_et_time)
-                
-                if actual_market_url != self._current_market_url:
-                    logger.info(
-                        f"Polymarket: Market switched: "
-                        f"{self._current_market_url} -> {actual_market_url}"
-                    )
-                    self._current_market_url = actual_market_url
-                    await self._update_token_ids(actual_market_url)
+                # NOW apply pending tokens and trigger reconnection
+                # This is the atomic switch point
+                if self._pending_token_ids is not None:
+                    self._apply_pending_tokens()
+                else:
+                    # No pending tokens (same market or prefetch failed)
+                    # Try direct fetch as fallback
+                    current_et_time = get_eastern_time()
+                    actual_market_url = derive_market_url(self.market_slug, current_et_time)
+                    
+                    if actual_market_url != self._current_market_url:
+                        logger.info(
+                            f"Polymarket: Fallback fetch for {self.market_slug}: "
+                            f"{actual_market_url}"
+                        )
+                        result = await self._fetch_token_ids(actual_market_url)
+                        if result:
+                            token_ids, labels = result
+                            self._pending_token_ids = token_ids
+                            self._pending_labels = labels
+                            self._pending_market_url = actual_market_url
+                            self._apply_pending_tokens()
             
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Polymarket: Discovery error: {e}")
+                logger.warning(
+                    f"Polymarket: Discovery error for {self.market_slug}: {e}"
+                )
                 await asyncio.sleep(60)
     
     async def run(self, shutdown_event: Optional[asyncio.Event] = None) -> None:
