@@ -1,6 +1,7 @@
 """Main orchestrator for the collector."""
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -52,6 +53,11 @@ class Collector:
         self.buffer = StreamBuffer()
         self.heartbeat = HeartbeatWriter(self.state_dir)
         
+        # Track finalized hours (monotonic finalization)
+        self._finalized_hours: set[tuple[str, str, str, int]] = set()  # (venue, stream_id, date, hour)
+        self._finalization_state_file = self.state_dir / "finalization_state.json"
+        self._load_finalization_state()
+        
         # Consumers
         self.binance_consumer = BinanceConsumer(
             symbols=binance_symbols or BINANCE_SYMBOLS,
@@ -64,6 +70,44 @@ class Collector:
         
         self._shutdown_event = asyncio.Event()
         self._tasks = []
+    
+    def _load_finalization_state(self):
+        """Load finalized hours from state file."""
+        if self._finalization_state_file.exists():
+            try:
+                with open(self._finalization_state_file, "r") as f:
+                    data = json.load(f)
+                    self._finalized_hours = {
+                        tuple(item) for item in data.get("finalized_hours", [])
+                    }
+            except Exception:
+                self._finalized_hours = set()
+        else:
+            self._finalized_hours = set()
+    
+    def _save_finalization_state(self):
+        """Save finalized hours to state file."""
+        try:
+            data = {
+                "finalized_hours": [list(key) for key in self._finalized_hours]
+            }
+            temp_file = self._finalization_state_file.with_suffix(".tmp")
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(self._finalization_state_file)
+        except Exception:
+            pass  # Don't fail if state saving fails
+    
+    def _is_finalized(self, venue: str, stream_id: str, date: str, hour: int) -> bool:
+        """Check if an hour has already been finalized."""
+        key = (venue, stream_id, date, hour)
+        return key in self._finalized_hours
+    
+    def _mark_finalized(self, venue: str, stream_id: str, date: str, hour: int):
+        """Mark an hour as finalized."""
+        key = (venue, stream_id, date, hour)
+        self._finalized_hours.add(key)
+        self._save_finalization_state()
     
     def _on_row(self, row: dict):
         """Callback when a row is received from any stream."""
@@ -112,39 +156,31 @@ class Collector:
                 await asyncio.sleep(1.0)
     
     async def _finalization_task(self):
-        """Finalize hours at UTC boundaries."""
+        """Finalize hours at UTC boundaries - monotonic (never finalize same hour twice)."""
+        from datetime import datetime, timezone, timedelta
+        
         while not self._shutdown_event.is_set():
             try:
                 # Wait until next hour boundary
                 wait_seconds = seconds_until_next_hour()
                 if wait_seconds > 0:
-                    logger.info(f"Waiting {wait_seconds:.1f}s until next hour boundary for finalization")
+                    if wait_seconds > 60:  # Only log if more than 1 minute
+                        logger.info(f"Waiting {wait_seconds:.1f}s until next hour boundary for finalization")
                     await asyncio.sleep(wait_seconds)
                 
                 if self._shutdown_event.is_set():
                     break
                 
-                # Get the hour that just ended
-                date, hour = get_current_utc_hour()
-                # Actually, we want to finalize the PREVIOUS hour
-                from datetime import datetime, timezone, timedelta
+                # Get the hour that just ended (previous hour)
                 now = datetime.now(timezone.utc)
                 prev_hour_time = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
                 date = prev_hour_time.strftime("%Y-%m-%d")
                 hour = prev_hour_time.hour
                 
-                logger.info(f"Finalizing hour: {date} {hour:02d}:00 UTC")
-                
-                # Get all active streams for this hour
-                active_keys = self.buffer.get_all_active_keys()
+                # Find all streams that need finalization (have checkpoints or data)
                 streams_to_finalize = set()
                 
-                for (v, s, d, h) in active_keys:
-                    if d == date and h == hour:
-                        streams_to_finalize.add((v, s, d, h))
-                
-                # Also check for any checkpoints that exist (in case of restart)
-                # We need to finalize all streams that have checkpoints, even if not in buffer
+                # Check for checkpoints that exist
                 for venue_dir in self.tmp_dir.glob("venue=*"):
                     venue = venue_dir.name.split("=")[1]
                     for stream_dir in venue_dir.glob("stream_id=*"):
@@ -155,42 +191,61 @@ class Collector:
                             if hour_dir.exists() and list(hour_dir.glob("checkpoint-*.parquet")):
                                 streams_to_finalize.add((venue, stream_id, date, hour))
                 
-                # Finalize each stream
-                for venue, stream_id, d, h in streams_to_finalize:
-                    try:
-                        # Flush any remaining buffer for this hour
-                        remaining_rows = self.buffer.get_buffer(venue, stream_id, d, h)
-                        if remaining_rows:
-                            await asyncio.to_thread(
-                                write_checkpoint,
+                # Also check active buffers
+                active_keys = self.buffer.get_all_active_keys()
+                for (v, s, d, h) in active_keys:
+                    if d == date and h == hour:
+                        streams_to_finalize.add((v, s, d, h))
+                
+                # Only finalize hours that haven't been finalized yet (monotonic)
+                streams_to_finalize = {
+                    (v, s, d, h) for (v, s, d, h) in streams_to_finalize
+                    if not self._is_finalized(v, s, d, h)
+                }
+                
+                if streams_to_finalize:
+                    logger.info(f"Finalizing hour: {date} {hour:02d}:00 UTC ({len(streams_to_finalize)} streams)")
+                    
+                    # Finalize each stream
+                    for venue, stream_id, d, h in streams_to_finalize:
+                        try:
+                            # Flush any remaining buffer for this hour
+                            remaining_rows = self.buffer.get_buffer(venue, stream_id, d, h)
+                            if remaining_rows:
+                                await asyncio.to_thread(
+                                    write_checkpoint,
+                                    self.tmp_dir,
+                                    venue,
+                                    stream_id,
+                                    d,
+                                    h,
+                                    remaining_rows,
+                                )
+                                self.buffer.clear_buffer(venue, stream_id, d, h)
+                            
+                            # Finalize (idempotent - skips if already finalized)
+                            success = await asyncio.to_thread(
+                                finalize_hour,
                                 self.tmp_dir,
+                                self.final_dir,
                                 venue,
                                 stream_id,
                                 d,
                                 h,
-                                remaining_rows,
                             )
-                            self.buffer.clear_buffer(venue, stream_id, d, h)
+                            
+                            if success:
+                                self._mark_finalized(venue, stream_id, d, h)
+                                logger.info(f"Finalized: {venue}/{stream_id}/{d}/{h:02d}")
+                            else:
+                                logger.warning(f"Finalization returned False: {venue}/{stream_id}/{d}/{h:02d}")
                         
-                        # Finalize
-                        success = await asyncio.to_thread(
-                            finalize_hour,
-                            self.tmp_dir,
-                            self.final_dir,
-                            venue,
-                            stream_id,
-                            d,
-                            h,
-                        )
-                        
-                        if success:
-                            logger.info(f"Finalized: {venue}/{stream_id}/{d}/{h:02d}")
-                        else:
-                            logger.warning(f"Finalization returned False: {venue}/{stream_id}/{d}/{h:02d}")
-                    
-                    except Exception as e:
-                        logger.error(f"Failed to finalize {venue}/{stream_id}/{d}/{h:02d}: {e}")
-                        # Continue with other streams
+                        except Exception as e:
+                            logger.error(f"Failed to finalize {venue}/{stream_id}/{d}/{h:02d}: {e}")
+                            # Continue with other streams
+                else:
+                    # No streams to finalize for this hour (already done or no data)
+                    pass
             
             except asyncio.CancelledError:
                 break

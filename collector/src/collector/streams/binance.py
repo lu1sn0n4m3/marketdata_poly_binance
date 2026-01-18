@@ -34,6 +34,8 @@ class BinanceConsumer:
         self._running = False
         self._backoff_seconds = 1.0
         self._max_backoff = 60.0
+        self._last_message_time: Optional[float] = None  # Track last data message
+        self._data_timeout_seconds = 300.0  # 5 minutes - reconnect if no data for this long
     
     def _normalize_row(self, stream_name: str, payload: dict, recv_ts_ms: int) -> dict:
         """
@@ -110,17 +112,43 @@ class BinanceConsumer:
                 ) as ws:
                     logger.info(f"Binance connected: {len(self.symbols)} symbols")
                     self._backoff_seconds = 1.0  # Reset backoff on successful connection
+                    self._last_message_time = time_ns() / 1_000_000_000  # Reset on connection
                     
-                    async for message in ws:
-                        if shutdown_event and shutdown_event.is_set():
-                            break
-                        if not self._running:
-                            break
+                    # Watchdog task to detect stale connections (no data updates)
+                    async def _watchdog():
+                        while self._running and not (shutdown_event and shutdown_event.is_set()):
+                            await asyncio.sleep(30)  # Check every 30 seconds
+                            if self._last_message_time is None:
+                                continue
+                            now = time_ns() / 1_000_000_000
+                            elapsed = now - self._last_message_time
+                            if elapsed > self._data_timeout_seconds:
+                                logger.warning(f"No Binance data received for {elapsed:.0f}s, reconnecting...")
+                                await ws.close()
+                                break
+                    
+                    watchdog_task = asyncio.create_task(_watchdog())
+                    
+                    try:
+                        async for message in ws:
+                            # Update last message time on any data received
+                            self._last_message_time = time_ns() / 1_000_000_000
+                            
+                            if shutdown_event and shutdown_event.is_set():
+                                break
+                            if not self._running:
+                                break
+                            try:
+                                self._handle_message(message)
+                            except Exception as e:
+                                logger.warning(f"Error handling Binance message: {e}")
+                                continue
+                    finally:
+                        watchdog_task.cancel()
                         try:
-                            self._handle_message(message)
-                        except Exception as e:
-                            logger.warning(f"Error handling Binance message: {e}")
-                            continue
+                            await watchdog_task
+                        except asyncio.CancelledError:
+                            pass
             
             except asyncio.CancelledError:
                 break

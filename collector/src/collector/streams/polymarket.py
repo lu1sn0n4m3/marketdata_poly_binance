@@ -27,18 +27,13 @@ def parse_polymarket_url(url: str) -> Optional[str]:
 
 def get_eastern_time() -> datetime:
     """
-    Get current Eastern Time (ET) from UTC+1 system time.
+    Get current Eastern Time (ET) from UTC.
     
-    Note: This assumes the system clock is UTC+1.
+    Note: Always uses UTC as the source, not system timezone.
     ET is UTC-5 (EST) or UTC-4 (EDT).
     """
-    # Get system time (assumed to be UTC+1)
-    # We create a timezone-aware datetime representing UTC+1
-    system_tz = timezone(timedelta(hours=1))
-    system_now = datetime.now(system_tz)
-    
-    # Convert to UTC
-    utc_now = system_now.astimezone(timezone.utc)
+    # Always use UTC (timezone-independent)
+    utc_now = datetime.now(timezone.utc)
     
     # Convert to Eastern Time
     # ET is UTC-5 (EST) or UTC-4 (EDT)
@@ -133,6 +128,8 @@ class PolymarketConsumer:
         self._backoff_seconds = 1.0
         self._max_backoff = 60.0
         self._current_market_url: Optional[str] = None
+        self._last_message_time: Optional[float] = None  # Track last data message (not ping/pong)
+        self._data_timeout_seconds = 300.0  # 5 minutes - reconnect if no data for this long
     
     async def _discover_current_market(self) -> Optional[str]:
         """Discover the current market URL based on Eastern time."""
@@ -331,20 +328,63 @@ class PolymarketConsumer:
         await self._update_token_ids(current_market_url)
         self._current_market_url = current_market_url
         
-        # Hourly market discovery task
+        # Hourly market discovery task - fetch next market 1 minute before UTC hour boundary
         async def _hourly_discovery():
+            from ..time.boundaries import get_next_hour_boundary_utc, seconds_until_next_hour
+            
             while self._running:
                 if shutdown_event and shutdown_event.is_set():
                     break
-                await asyncio.sleep(3600)  # Check every hour
+                
+                # Calculate time until next UTC hour boundary
+                next_utc_hour = get_next_hour_boundary_utc()
+                now_utc = datetime.now(timezone.utc)
+                seconds_to_next_hour = (next_utc_hour - now_utc).total_seconds()
+                
+                # Wait until 1 minute before the UTC hour boundary
+                wait_time = max(0, seconds_to_next_hour - 60.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                
                 if shutdown_event and shutdown_event.is_set():
                     break
                 
-                new_market_url = await self._discover_current_market()
-                if new_market_url != self._current_market_url:
-                    logger.info(f"Polymarket market changed: {self._current_market_url} -> {new_market_url}")
-                    self._current_market_url = new_market_url
-                    await self._update_token_ids(new_market_url)
+                # Calculate what ET time will be at the next UTC hour boundary
+                # Convert next UTC hour to ET
+                next_utc_hour_actual = get_next_hour_boundary_utc()
+                # Convert UTC to ET (ET is UTC-5 or UTC-4, we use UTC-5 for simplicity)
+                et_tz = timezone(timedelta(hours=-5))
+                next_et_time = next_utc_hour_actual.astimezone(et_tz)
+                
+                # Derive market URL for that ET hour
+                next_market_url = derive_market_url(self.market_slug, next_et_time)
+                
+                if next_market_url != self._current_market_url:
+                    logger.info(f"Polymarket fetching token IDs for next hour: {next_market_url}")
+                    # Fetch token IDs for the next hour's market (pre-fetch at XX:59)
+                    await self._update_token_ids(next_market_url)
+                
+                # Wait the remaining ~1 minute until UTC hour boundary
+                remaining = seconds_until_next_hour()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                
+                # At XX:00:00 UTC, switch to the new market
+                if shutdown_event and shutdown_event.is_set():
+                    break
+                
+                # Re-calculate to get the actual current market (in case timing drifted)
+                current_et_time = get_eastern_time()
+                actual_market_url = derive_market_url(self.market_slug, current_et_time)
+                
+                if actual_market_url != self._current_market_url:
+                    logger.info(f"Polymarket market switched at hour boundary: {self._current_market_url} -> {actual_market_url}")
+                    self._current_market_url = actual_market_url
+                    # Token IDs should already be updated, but ensure they are
+                    await self._update_token_ids(actual_market_url)
+        
+        # Track expected market URL for current connection
+        connection_market_url = None
         
         discovery_task = asyncio.create_task(_hourly_discovery())
         
@@ -353,11 +393,19 @@ class PolymarketConsumer:
                 if shutdown_event and shutdown_event.is_set():
                     break
                 
+                # Check if market has changed - if so, we need to reconnect with new token IDs
+                if self._current_market_url and self._current_market_url != connection_market_url:
+                    logger.info(f"Market changed, will reconnect: {connection_market_url} -> {self._current_market_url}")
+                    connection_market_url = None  # Force reconnect
+                
                 if not self._token_ids:
                     logger.warning("No token IDs available, waiting...")
                     await asyncio.sleep(5)
                     await self._update_token_ids(self._current_market_url)
                     continue
+                
+                # Update connection market URL
+                connection_market_url = self._current_market_url
                 
                 try:
                     async with websockets.connect(
@@ -368,19 +416,53 @@ class PolymarketConsumer:
                         compression=None,
                     ) as ws:
                         await ws.send(orjson.dumps({"type": "market", "assets_ids": self._token_ids}))
-                        logger.info(f"Polymarket connected: {len(self._token_ids)} tokens for {self.market_slug}")
+                        logger.info(f"Polymarket connected: {len(self._token_ids)} tokens for {self.market_slug} (market: {self._current_market_url})")
                         self._backoff_seconds = 1.0
+                        self._last_message_time = time_ns() / 1_000_000_000  # Reset on connection
                         
-                        async for msg in ws:
-                            if shutdown_event and shutdown_event.is_set():
-                                break
-                            if not self._running:
-                                break
+                        # Start a watchdog task to detect stale connections
+                        async def _watchdog():
+                            while self._running and not shutdown_event.is_set():
+                                await asyncio.sleep(30)  # Check every 30 seconds
+                                # Check if market changed (need to reconnect)
+                                if self._current_market_url != connection_market_url:
+                                    await ws.close()
+                                    break
+                                if self._last_message_time is None:
+                                    continue
+                                now = time_ns() / 1_000_000_000
+                                elapsed = now - self._last_message_time
+                                if elapsed > self._data_timeout_seconds:
+                                    logger.warning(f"No Polymarket data received for {elapsed:.0f}s, reconnecting...")
+                                    await ws.close()
+                                    break
+                        
+                        watchdog_task = asyncio.create_task(_watchdog())
+                        
+                        try:
+                            async for msg in ws:
+                                # Check if market changed during connection (force reconnect)
+                                if self._current_market_url != connection_market_url:
+                                    break
+                                
+                                # Update last message time on any data received
+                                self._last_message_time = time_ns() / 1_000_000_000
+                                
+                                if shutdown_event and shutdown_event.is_set():
+                                    break
+                                if not self._running:
+                                    break
+                                try:
+                                    self._handle(msg, time_ns() // 1_000_000)
+                                except Exception as e:
+                                    logger.warning(f"Error handling Polymarket message: {e}")
+                                    continue
+                        finally:
+                            watchdog_task.cancel()
                             try:
-                                self._handle(msg, time_ns() // 1_000_000)
-                            except Exception as e:
-                                logger.warning(f"Error handling Polymarket message: {e}")
-                                continue
+                                await watchdog_task
+                            except asyncio.CancelledError:
+                                pass
                 
                 except asyncio.CancelledError:
                     break
