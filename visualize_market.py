@@ -14,7 +14,7 @@ import matplotlib.dates as mdates
 DATA_DIR = Path("./data/final")
 
 # Columns that must be stable plain strings for downstream ops
-FORCE_STRING_COLS = {"venue", "stream_id", "event_type", "side"}
+FORCE_STRING_COLS = {"event_type", "side"}  # venue/stream_id are in partition path, not in data
 
 
 def _normalize_table(table: pa.Table) -> pa.Table:

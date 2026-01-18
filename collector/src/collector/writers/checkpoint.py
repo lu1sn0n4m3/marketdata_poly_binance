@@ -8,13 +8,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Fixed schema that always uses plain strings for categorical columns
-# This prevents dictionary encoding issues during finalization
+# Note: venue and stream_id are excluded - they're already in the partition path
 BASE_SCHEMA = pa.schema([
     # Required fields (always present)
     pa.field("ts_event", pa.int64(), nullable=False),
     pa.field("ts_recv", pa.int64(), nullable=False),
-    pa.field("venue", pa.string(), nullable=False),  # Always plain string
-    pa.field("stream_id", pa.string(), nullable=False),  # Always plain string
     pa.field("seq", pa.int64(), nullable=False),
     
     # Optional fields (nullable because not all events have all fields)
@@ -36,23 +34,26 @@ def rows_to_table(rows: List[dict]) -> pa.Table:
     """
     Convert rows to Arrow table using fixed schema.
     
-    Ensures string columns are always plain Python strings (not categorical/dictionary).
+    Strips venue/stream_id (already in partition path) and ensures
+    string columns are always plain Python strings (not categorical/dictionary).
     """
-    # Normalize string fields to plain Python strings
+    # Create a copy of rows without venue/stream_id (they're in the partition path)
+    cleaned_rows = []
     for r in rows:
-        if "venue" in r and r["venue"] is not None:
-            r["venue"] = str(r["venue"])
-        if "stream_id" in r and r["stream_id"] is not None:
-            r["stream_id"] = str(r["stream_id"])
-        if "event_type" in r and r.get("event_type") is not None:
-            r["event_type"] = str(r["event_type"])
-        if "side" in r and r.get("side") is not None:
-            r["side"] = str(r["side"])
-        if "token_id" in r and r.get("token_id") is not None:
-            r["token_id"] = str(r["token_id"])
+        cleaned = {k: v for k, v in r.items() if k not in ("venue", "stream_id")}
+        
+        # Normalize string fields to plain Python strings
+        if "event_type" in cleaned and cleaned.get("event_type") is not None:
+            cleaned["event_type"] = str(cleaned["event_type"])
+        if "side" in cleaned and cleaned.get("side") is not None:
+            cleaned["side"] = str(cleaned["side"])
+        if "token_id" in cleaned and cleaned.get("token_id") is not None:
+            cleaned["token_id"] = str(cleaned["token_id"])
+        
+        cleaned_rows.append(cleaned)
     
     # Create table with explicit schema
-    return pa.Table.from_pylist(rows, schema=BASE_SCHEMA)
+    return pa.Table.from_pylist(cleaned_rows, schema=BASE_SCHEMA)
 
 
 def write_checkpoint(
