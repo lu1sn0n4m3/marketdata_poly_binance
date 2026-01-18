@@ -1,0 +1,55 @@
+# Production Docker Compose for VPS
+#
+# This file runs on the VPS and pulls pre-built images from GHCR.
+# No building happens on the VPS.
+#
+# Setup:
+#   1. Copy this file to VPS: /home/luis/marketdata/docker-compose.yml
+#   2. Create .env file with secrets (see .env.example)
+#   3. Login to GHCR: echo $GITHUB_PAT | docker login ghcr.io -u <username> --password-stdin
+#   4. Deploy: docker compose pull && docker compose up -d
+#
+# Rollback:
+#   1. Edit .env to change IMAGE_TAG to previous SHA
+#   2. docker compose pull && docker compose up -d
+
+services:
+  collector:
+    image: ghcr.io/${GITHUB_OWNER}/marketdata-collector:${IMAGE_TAG:-latest}
+    container_name: marketdata-collector
+    restart: unless-stopped
+    volumes:
+      - marketdata:/data
+    environment:
+      - COLLECTOR_DATA_DIR=/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  uploader:
+    image: ghcr.io/${GITHUB_OWNER}/marketdata-uploader:${IMAGE_TAG:-latest}
+    container_name: marketdata-uploader
+    restart: unless-stopped
+    volumes:
+      - marketdata:/data
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/data
+    depends_on:
+      - collector
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  marketdata:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/luis/marketdata/data

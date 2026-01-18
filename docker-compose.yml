@@ -1,0 +1,61 @@
+# Docker Compose for Marketdata Collector + Uploader
+#
+# Deployment on VPS:
+#   1. Clone repo to /home/luis/marketdata/repo
+#   2. Copy deploy/prod.env to /home/luis/marketdata/secrets/prod.env
+#   3. Run: docker compose up -d
+#
+# Data is stored in a named volume 'marketdata' mounted at /data in both containers.
+
+services:
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    container_name: marketdata-collector
+    restart: unless-stopped
+    volumes:
+      - marketdata:/data
+    environment:
+      - COLLECTOR_DATA_DIR=/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # No network needed for collector (uses websockets directly)
+    networks:
+      - default
+
+  uploader:
+    build:
+      context: ./uploader
+      dockerfile: Dockerfile
+    container_name: marketdata-uploader
+    restart: unless-stopped
+    volumes:
+      - marketdata:/data
+    env_file:
+      - ./deploy/prod.env
+    depends_on:
+      - collector
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - default
+
+volumes:
+  marketdata:
+    driver: local
+    # On VPS, you can bind to a specific path:
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /home/luis/marketdata/data
+
+networks:
+  default:
+    driver: bridge

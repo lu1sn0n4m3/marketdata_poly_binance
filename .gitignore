@@ -147,6 +147,13 @@ celerybeat.pid
 .env
 .envrc
 .venv
+prod.env
+deploy/prod.env
+deploy/secrets/
+# Allow example files
+!*.env.template
+!env.example
+!deploy/env.example
 env/
 venv/
 ENV/
