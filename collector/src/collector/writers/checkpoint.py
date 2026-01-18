@@ -7,6 +7,53 @@ from typing import List
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Fixed schema that always uses plain strings for categorical columns
+# This prevents dictionary encoding issues during finalization
+BASE_SCHEMA = pa.schema([
+    # Required fields (always present)
+    pa.field("ts_event", pa.int64(), nullable=False),
+    pa.field("ts_recv", pa.int64(), nullable=False),
+    pa.field("venue", pa.string(), nullable=False),  # Always plain string
+    pa.field("stream_id", pa.string(), nullable=False),  # Always plain string
+    pa.field("seq", pa.int64(), nullable=False),
+    
+    # Optional fields (nullable because not all events have all fields)
+    pa.field("event_type", pa.string(), nullable=True),  # Always plain string
+    pa.field("bid_px", pa.float64(), nullable=True),
+    pa.field("bid_sz", pa.float64(), nullable=True),
+    pa.field("ask_px", pa.float64(), nullable=True),
+    pa.field("ask_sz", pa.float64(), nullable=True),
+    pa.field("price", pa.float64(), nullable=True),
+    pa.field("size", pa.float64(), nullable=True),
+    pa.field("side", pa.string(), nullable=True),  # Always plain string
+    pa.field("update_id", pa.int64(), nullable=True),  # Binance BBO
+    pa.field("trade_id", pa.int64(), nullable=True),  # Binance trades
+    pa.field("token_id", pa.string(), nullable=True),  # Polymarket, always plain string
+])
+
+
+def rows_to_table(rows: List[dict]) -> pa.Table:
+    """
+    Convert rows to Arrow table using fixed schema.
+    
+    Ensures string columns are always plain Python strings (not categorical/dictionary).
+    """
+    # Normalize string fields to plain Python strings
+    for r in rows:
+        if "venue" in r and r["venue"] is not None:
+            r["venue"] = str(r["venue"])
+        if "stream_id" in r and r["stream_id"] is not None:
+            r["stream_id"] = str(r["stream_id"])
+        if "event_type" in r and r.get("event_type") is not None:
+            r["event_type"] = str(r["event_type"])
+        if "side" in r and r.get("side") is not None:
+            r["side"] = str(r["side"])
+        if "token_id" in r and r.get("token_id") is not None:
+            r["token_id"] = str(r["token_id"])
+    
+    # Create table with explicit schema
+    return pa.Table.from_pylist(rows, schema=BASE_SCHEMA)
+
 
 def write_checkpoint(
     tmp_dir: Path,
@@ -45,55 +92,16 @@ def write_checkpoint(
     filename = f"checkpoint-{timestamp}-{unique_id}.parquet"
     checkpoint_path = checkpoint_dir / filename
     
-    # Infer schema from first row
-    schema = _infer_schema(rows[0])
+    # Convert rows to table with fixed schema
+    table = rows_to_table(rows)
     
-    # Convert rows to Arrow table
-    columns = {field.name: [] for field in schema}
-    for row in rows:
-        for field in schema:
-            columns[field.name].append(row.get(field.name))
-    
-    table = pa.table(columns, schema=schema)
-    
-    # Write Parquet file
-    pq.write_table(table, checkpoint_path, compression="snappy")
+    # Write Parquet file with dictionary encoding disabled
+    # This ensures string columns remain plain strings
+    pq.write_table(
+        table,
+        checkpoint_path,
+        compression="snappy",
+        use_dictionary=False,  # Disable dictionary encoding to prevent schema issues
+    )
     
     return checkpoint_path
-
-
-def _infer_schema(first_row: dict) -> pa.Schema:
-    """
-    Infer PyArrow schema from a row dictionary.
-    
-    This creates a flexible schema that can handle both Binance and Polymarket rows.
-    """
-    fields = []
-    
-    # Required fields (always present)
-    fields.append(pa.field("ts_event", pa.int64()))
-    fields.append(pa.field("ts_recv", pa.int64()))
-    fields.append(pa.field("venue", pa.string()))
-    fields.append(pa.field("stream_id", pa.string()))
-    fields.append(pa.field("seq", pa.int64()))  # nullable
-    
-    # Optional fields (may be present depending on event type and venue)
-    optional_fields = {
-        "event_type": pa.string(),
-        "bid_px": pa.float64(),
-        "bid_sz": pa.float64(),
-        "ask_px": pa.float64(),
-        "ask_sz": pa.float64(),
-        "price": pa.float64(),
-        "size": pa.float64(),
-        "side": pa.string(),
-        "update_id": pa.int64(),  # Binance BBO
-        "trade_id": pa.int64(),   # Binance trades
-        "token_id": pa.string(),  # Polymarket
-    }
-    
-    for field_name, field_type in optional_fields.items():
-        if field_name in first_row:
-            fields.append(pa.field(field_name, field_type, nullable=True))
-    
-    return pa.schema(fields)
