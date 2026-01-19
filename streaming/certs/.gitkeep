@@ -1,0 +1,3 @@
+# This folder contains TLS certificates
+# Do NOT commit actual .crt or .key files!
+# Run scripts/generate-certs.sh to generate them

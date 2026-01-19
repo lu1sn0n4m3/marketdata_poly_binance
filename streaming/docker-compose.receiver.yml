@@ -1,0 +1,27 @@
+# Deploy on Amsterdam VPS
+# Usage: docker compose -f docker-compose.receiver.yml up -d --build
+
+services:
+  binance-receiver:
+    build:
+      context: ./receiver
+      dockerfile: Dockerfile
+    container_name: binance-receiver
+    restart: always
+    ports:
+      - "9001:9001"
+    environment:
+      - PORT=9001
+      - TZ=UTC
+    volumes:
+      - ./certs:/certs:ro               # Mount TLS certificates
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

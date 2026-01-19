@@ -1,0 +1,11 @@
+# Minimal RTT test container
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir py-clob-client
+
+COPY test_polymarket_rtt.py .
+
+# Required env vars: POLY_PRIVATE_KEY, POLY_FUNDER, POLY_TOKEN_ID
+ENTRYPOINT ["python", "test_polymarket_rtt.py"]

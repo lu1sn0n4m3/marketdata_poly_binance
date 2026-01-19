@@ -221,3 +221,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# TLS Certificates (keep .gitkeep)
+streaming/certs/*.crt
+streaming/certs/*.key
+*.crt
+*.key

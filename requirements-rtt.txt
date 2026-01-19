@@ -1,0 +1,2 @@
+# Requirements for test_polymarket_rtt.py
+py-clob-client
