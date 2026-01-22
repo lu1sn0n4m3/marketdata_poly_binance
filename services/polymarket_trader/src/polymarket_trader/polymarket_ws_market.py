@@ -99,10 +99,11 @@ class PolymarketMarketWsClient:
         if not self._ws or not self._token_ids:
             return
         
-        # Subscribe to token updates
+        # Subscribe to token updates (per Polymarket WSS spec)
         msg = {
-            "type": "market",
+            "type": "MARKET",
             "assets_ids": self._token_ids,
+            "custom_feature_enabled": False,
         }
         await self._ws.send(orjson.dumps(msg))
         logger.info(f"Subscribed to {len(self._token_ids)} tokens")

@@ -237,9 +237,10 @@ class RiskEngine:
         """
         clamped = StrategyIntent()
         
-        # If HALT, cancel all
+        # If HALT, cancel all only if we believe there are open orders
         if risk_decision.allowed_mode == RiskMode.HALT:
-            clamped.cancel_all = True
+            if state.open_orders:
+                clamped.cancel_all = True
             return clamped
         
         # Clamp quotes first, then check if allowed

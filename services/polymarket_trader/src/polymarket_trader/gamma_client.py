@@ -51,11 +51,15 @@ class GammaClient:
         """
         Derive the hourly market slug from base slug and timestamp.
         
-        For BTC hourly markets, the slug format is typically:
-        {base-slug}-{month}-{day}-{hour}pm-et
+        For BTC hourly markets, the slug format is:
+        bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+        
+        Example: bitcoin-up-or-down-january-22-7am-et
+        
+        The time in the slug indicates when the market STARTS (in Eastern Time).
         
         Args:
-            market_slug: Base market slug
+            market_slug: Base market slug (e.g., "bitcoin-up-or-down")
             now_ms: Current timestamp in milliseconds
         
         Returns:
@@ -63,7 +67,18 @@ class GammaClient:
         """
         # Convert to Eastern Time
         utc_now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
-        et_tz = timezone(timedelta(hours=-5))  # EST (DST handling TODO)
+        
+        # Handle Eastern Time with DST awareness
+        # EST = UTC-5, EDT = UTC-4
+        # For simplicity, we use a fixed offset. For production, consider pytz.
+        # EDT is typically Mar-Nov, EST is Nov-Mar
+        # For now, use -5 (EST) as default
+        et_offset_hours = -5
+        if utc_now.month >= 3 and utc_now.month < 11:
+            # Rough EDT approximation (March-November)
+            et_offset_hours = -4
+        
+        et_tz = timezone(timedelta(hours=et_offset_hours))
         et_time = utc_now.astimezone(et_tz)
         
         month_names = [
@@ -78,6 +93,7 @@ class GammaClient:
             hour_12 = 12
         am_pm = "pm" if et_time.hour >= 12 else "am"
         
+        # Format: bitcoin-up-or-down-january-22-7am-et
         return f"{market_slug}-{month}-{day}-{hour_12}{am_pm}-et"
     
     async def get_current_hour_market(
@@ -89,7 +105,7 @@ class GammaClient:
         Get the current hourly market.
         
         Args:
-            market_slug: Base market slug (e.g., "bitcoin-btc-price-on-january-31")
+            market_slug: Base market slug (e.g., "bitcoin-up-or-down")
             now_ms: Current timestamp in milliseconds
         
         Returns:

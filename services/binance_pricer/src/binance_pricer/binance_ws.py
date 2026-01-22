@@ -142,7 +142,10 @@ class BinanceWsClient:
     
     async def emit(self, event: BinanceEvent) -> None:
         """
-        Emit an event to the queue and callback.
+        Emit an event to the queue and/or callback.
+        
+        If a callback is set, events go to the callback only.
+        If no callback is set, events go to the queue for polling.
         
         Args:
             event: BinanceEvent to emit
@@ -151,18 +154,19 @@ class BinanceWsClient:
         self.health.last_event_ts_exchange_ms = event.ts_exchange_ms
         self.health.last_event_ts_local_ms = event.ts_local_ms
         
-        # Put in queue (non-blocking, drop if full)
-        try:
-            self.out_queue.put_nowait(event)
-        except asyncio.QueueFull:
-            logger.warning("Event queue full, dropping event")
-        
-        # Call callback if set
+        # Use callback if set, otherwise queue
         if self._on_event:
+            # Callback mode - events processed immediately
             try:
                 await self._on_event(event)
             except Exception as e:
                 logger.warning(f"Error in event callback: {e}")
+        else:
+            # Queue mode - events buffered for polling
+            try:
+                self.out_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("Event queue full, dropping event")
     
     async def connect(self) -> None:
         """Establish WebSocket connection."""

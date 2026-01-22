@@ -18,7 +18,8 @@ class BConfig:
     
     # Market discovery
     gamma_api_url: str = "https://gamma-api.polymarket.com"
-    market_slug: str = "bitcoin-btc-price-on-january-31"  # Base market slug
+    # Base market slug - date/time appended automatically (e.g., bitcoin-up-or-down-january-22-7am-et)
+    market_slug: str = "bitcoin-up-or-down"
     
     # Polymarket WebSocket URLs
     pm_ws_market_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -28,10 +29,17 @@ class BConfig:
     pm_rest_url: str = "https://clob.polymarket.com"
     
     # Authentication (loaded from env)
+    # REQUIRED: Private key for signing orders
+    pm_private_key: str = ""
+    # REQUIRED: Funder address (your proxy wallet address)
+    pm_funder: str = ""
+    # Signature type: 1=EOA (direct wallet), 2=Proxy wallet (Safe)
+    # Use 1 for EOA wallets, 2 for Safe/proxy wallets
+    pm_signature_type: int = 1
+    # OPTIONAL: L2 API credentials (auto-derived from private key if not provided)
     pm_api_key: str = ""
     pm_api_secret: str = ""
     pm_passphrase: str = ""
-    pm_private_key: str = ""  # For signing
     
     # SQLite journal
     sqlite_path: str = "/data/journal.db"
@@ -83,7 +91,7 @@ class BConfig:
                 "GAMMA_API_URL",
                 "https://gamma-api.polymarket.com"
             ),
-            market_slug=os.getenv("MARKET_SLUG", "bitcoin-btc-price-on-january-31"),
+            market_slug=os.getenv("MARKET_SLUG", "bitcoin-up-or-down"),
             pm_ws_market_url=os.getenv(
                 "PM_WS_MARKET_URL",
                 "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -93,10 +101,14 @@ class BConfig:
                 "wss://ws-subscriptions-clob.polymarket.com/ws/user"
             ),
             pm_rest_url=os.getenv("PM_REST_URL", "https://clob.polymarket.com"),
+            # REQUIRED for order signing
+            pm_private_key=os.getenv("PM_PRIVATE_KEY", ""),
+            pm_funder=os.getenv("PM_FUNDER", ""),
+            pm_signature_type=int(os.getenv("PM_SIGNATURE_TYPE", "1")),
+            # OPTIONAL L2 credentials (auto-derived if not set)
             pm_api_key=os.getenv("PM_API_KEY", ""),
             pm_api_secret=os.getenv("PM_API_SECRET", ""),
             pm_passphrase=os.getenv("PM_PASSPHRASE", ""),
-            pm_private_key=os.getenv("PM_PRIVATE_KEY", ""),
             sqlite_path=os.getenv("SQLITE_PATH", "/data/journal.db"),
             session_timers=session_timers,
             max_reserved_capital=float(os.getenv("MAX_RESERVED_CAPITAL", "1000.0")),
@@ -128,3 +140,21 @@ class BConfig:
         
         if self.control_port < 1 or self.control_port > 65535:
             raise ValueError("control_port must be between 1 and 65535")
+        
+        # Polymarket credentials validation
+        if not self.pm_private_key:
+            raise ValueError(
+                "PM_PRIVATE_KEY is required for order signing. "
+                "Set your wallet private key (0x prefixed)."
+            )
+        
+        if not self.pm_funder:
+            raise ValueError(
+                "PM_FUNDER is required. Set your proxy wallet/funder address (0x prefixed). "
+                "This is your Polymarket trading address."
+            )
+        
+        if self.pm_signature_type not in (1, 2):
+            raise ValueError(
+                "PM_SIGNATURE_TYPE must be 1 (EOA) or 2 (Proxy wallet/Safe)"
+            )

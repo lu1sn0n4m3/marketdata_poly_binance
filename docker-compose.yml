@@ -97,15 +97,16 @@ services:
       - POLL_SNAPSHOT_HZ=50
       - SNAPSHOT_URL=http://binance_pricer:8080/snapshot/latest
       - GAMMA_API_URL=https://gamma-api.polymarket.com
-      - MARKET_SLUG=bitcoin-btc-price-on-january-31
+      - MARKET_SLUG=bitcoin-up-or-down
       - SQLITE_PATH=/data/journal.db
       - CONTROL_HOST=0.0.0.0
       - CONTROL_PORT=9000
       - LOG_LEVEL=INFO
-      # Risk limits (adjust as needed)
-      - MAX_RESERVED_CAPITAL=1000.0
-      - MAX_POSITION_SIZE=500.0
-      - MAX_ORDER_SIZE=100.0
+      # Risk limits (from prod.env, adjust as needed)
+      # Note: these are overridden by prod.env if set there
+      - MAX_RESERVED_CAPITAL=5.0
+      - MAX_POSITION_SIZE=5.0
+      - MAX_ORDER_SIZE=5.0
       - MAX_OPEN_ORDERS=4
       # Session timers (in ms)
       - T_WIND_MS=600000

@@ -50,6 +50,7 @@ class PolymarketUserWsClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         
         self._last_msg_local_ms: Optional[int] = None
+        self._market_ids: list[str] = []
         
         # Event queue
         self.out_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=10000)
@@ -63,25 +64,30 @@ class PolymarketUserWsClient:
     def last_msg_local_ms(self) -> Optional[int]:
         """Timestamp of last message."""
         return self._last_msg_local_ms
+
+    def set_markets(self, market_ids: list[str]) -> None:
+        """Set market IDs (condition IDs) to subscribe to."""
+        self._market_ids = market_ids
+
+    def set_auth(self, api_key: str, api_secret: str, passphrase: str) -> None:
+        """Update auth credentials (e.g., after REST derivation)."""
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._passphrase = passphrase
     
     async def connect(self) -> None:
         """Establish WebSocket connection."""
         logger.info(f"Connecting to Polymarket user WS: {self._ws_url[:50]}...")
         
-        # Add auth headers if available
-        headers = {}
-        if self._api_key:
-            headers["POLY-API-KEY"] = self._api_key
-        if self._passphrase:
-            headers["POLY-PASSPHRASE"] = self._passphrase
+        # Build connection kwargs
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 60,
+            "max_size": 2**20,
+        }
         
-        self._ws = await websockets.connect(
-            self._ws_url,
-            extra_headers=headers if headers else None,
-            ping_interval=20,
-            ping_timeout=60,
-            max_size=2**20,
-        )
+        # Polymarket user WS auth is provided in subscribe payload (not headers)
+        self._ws = await websockets.connect(self._ws_url, **connect_kwargs)
         self._connected = True
         logger.info("Connected to Polymarket user WS")
         
@@ -97,8 +103,23 @@ class PolymarketUserWsClient:
         if not self._ws:
             return
         
-        # Subscribe to user channel
-        msg = {"type": "user"}
+        if not self._api_key or not self._api_secret or not self._passphrase:
+            logger.warning("User WS auth credentials missing; cannot subscribe")
+            return
+        if not self._market_ids:
+            logger.warning("User WS markets missing; cannot subscribe")
+            return
+        
+        # Subscribe to user channel with auth payload
+        msg = {
+            "type": "USER",
+            "auth": {
+                "apikey": self._api_key,
+                "secret": self._api_secret,
+                "passphrase": self._passphrase,
+            },
+            "markets": self._market_ids,
+        }
         await self._ws.send(orjson.dumps(msg))
         logger.info("Subscribed to user channel")
     

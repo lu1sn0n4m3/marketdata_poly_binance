@@ -279,6 +279,17 @@ class StateReducer:
             if event.ws_name == "user":
                 # Stay in HALT until we verify state
                 logger.info(f"WS {event.ws_name} reconnected - awaiting reconciliation")
+            
+            # If all connections are healthy, resume NORMAL trading
+            if (
+                self.state.risk_mode == RiskMode.HALT and
+                self.state.session_state == SessionState.ACTIVE and
+                self.state.health.market_ws_connected and
+                self.state.health.user_ws_connected and
+                self.state.health.rest_healthy
+            ):
+                logger.info("All connections healthy - resuming NORMAL trading")
+                self.state.risk_mode = RiskMode.NORMAL
     
     def stop(self) -> None:
         """Stop the reducer."""

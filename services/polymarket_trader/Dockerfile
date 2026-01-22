@@ -30,11 +30,17 @@ RUN mkdir -p /data
 ENV POLL_SNAPSHOT_HZ=50
 ENV SNAPSHOT_URL=http://binance_pricer:8080/snapshot/latest
 ENV GAMMA_API_URL=https://gamma-api.polymarket.com
-ENV MARKET_SLUG=bitcoin-btc-price-on-january-31
+# Base market slug - date/time appended automatically (e.g., bitcoin-up-or-down-january-22-7am-et)
+ENV MARKET_SLUG=bitcoin-up-or-down
 ENV SQLITE_PATH=/data/journal.db
 ENV CONTROL_HOST=0.0.0.0
 ENV CONTROL_PORT=9000
 ENV LOG_LEVEL=INFO
+# Risk limits (override in prod.env)
+ENV MAX_RESERVED_CAPITAL=5.0
+ENV MAX_POSITION_SIZE=5.0
+ENV MAX_ORDER_SIZE=5.0
+ENV MAX_OPEN_ORDERS=4
 
 # Expose control plane port
 EXPOSE 9000

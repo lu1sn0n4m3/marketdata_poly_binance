@@ -141,10 +141,49 @@ class Executor:
             result = await self.rest.cancel_order(order_id)
             
             if not result.success:
-                logger.warning(f"Cancel failed for {order_id}: {result.error_msg}")
+                error_lower = result.error_msg.lower()
+                # If order "can't be found" or "already canceled", it's gone from exchange
+                # Emit a synthetic cancel event to remove it from local state
+                if "not found" in error_lower or "already canceled" in error_lower or "not_cancelable" in error_lower:
+                    logger.debug(f"Order {order_id} already gone from exchange, emitting synthetic cancel")
+                    await self._emit_synthetic_cancel(order_id)
+                else:
+                    logger.warning(f"Cancel failed for {order_id}: {result.error_msg}")
+            else:
+                # Successful cancel - also emit synthetic event in case WS is delayed
+                logger.debug(f"Cancel succeeded for {order_id}, emitting synthetic cancel")
+                await self._emit_synthetic_cancel(order_id)
         
         except Exception as e:
             logger.error(f"Cancel error for {order_id}: {e}")
+    
+    async def _emit_synthetic_cancel(self, order_id: str) -> None:
+        """
+        Emit a synthetic UserOrderEvent to mark an order as cancelled.
+        
+        This is used when we know an order is gone from the exchange
+        (either from successful cancel or "not found" response).
+        """
+        from .types import UserOrderEvent, OrderStatus, Side
+        
+        event = UserOrderEvent(
+            event_type=None,
+            ts_local_ms=time_ns() // 1_000_000,
+            order_id=order_id,
+            status=OrderStatus.CANCELLED,
+            side=Side.BUY,  # Doesn't matter for removal
+            price=0.0,
+            size=0.0,
+            filled=0.0,
+            remaining=0.0,
+            token_id="",
+        )
+        
+        if self._out_queue:
+            try:
+                self._out_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("Executor queue full, dropping synthetic cancel event")
     
     async def cancel_all(self, market_id: str) -> None:
         """

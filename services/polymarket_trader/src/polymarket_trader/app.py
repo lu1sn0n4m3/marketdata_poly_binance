@@ -98,9 +98,11 @@ class ContainerBApp:
             market_slug=self.config.market_slug,
         )
         
-        # REST client
+        # REST client with order signing
         self.rest = PolymarketRestClient(
-            base_url=self.config.pm_rest_url,
+            private_key=self.config.pm_private_key,
+            funder=self.config.pm_funder,
+            signature_type=self.config.pm_signature_type,
             api_key=self.config.pm_api_key,
             api_secret=self.config.pm_api_secret,
             passphrase=self.config.pm_passphrase,
@@ -233,6 +235,8 @@ class ContainerBApp:
                 [market.tokens.yes_token_id, market.tokens.no_token_id],
                 market.condition_id,
             )
+            if self.user_ws:
+                self.user_ws.set_markets([market.condition_id])
             
             logger.info(f"Selected market: {market.market_slug}")
             return True
@@ -246,6 +250,20 @@ class ContainerBApp:
         
         # Setup components
         self._setup_components()
+        
+        # Initialize REST client (derives API credentials from private key)
+        if not await self.rest.initialize():
+            logger.error("Failed to initialize Polymarket REST client")
+            raise RuntimeError("REST client initialization failed")
+        logger.info("Polymarket REST client initialized with order signing")
+
+        # Ensure User WS has derived API credentials
+        if self.user_ws:
+            self.user_ws.set_auth(
+                api_key=self.rest.api_key,
+                api_secret=self.rest.api_secret,
+                passphrase=self.rest.passphrase,
+            )
         
         # Initialize journal
         self.journal.init_schema()
