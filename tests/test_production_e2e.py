@@ -4,8 +4,11 @@ Production-Style End-to-End Test
 
 Tests the full HourMM framework with human-readable output.
 
-Uses a WalkingStrategy that cycles bid prices: 1c -> 2c -> 3c -> 2c -> 1c...
-to demonstrate order placement, cancellation, and state management.
+Uses a WorseSpreadStrategy that places orders 2 cents WORSE than market:
+  - YES buy order 2 cents below market bid
+  - NO buy order to simulate YES sell 2 cents above market ask
+
+This allows market making without splitting USDC into shares upfront.
 
 REQUIRES CREDENTIALS in deploy/prod.env:
     PM_PRIVATE_KEY=0x...
@@ -122,8 +125,12 @@ from polymarket_trader.simple_strategy import (
     SimpleStrategy, StrategyContext, TargetQuotes
 )
 from polymarket_trader.simple_executor import SimpleExecutor, OpenOrder
+from polymarket_trader.polymarket_rest import OrderRequest
 from hourmm_common.schemas import BinanceSnapshot
 from hourmm_common.enums import Side
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -151,34 +158,89 @@ class DummyPricer(Pricer):
 class WalkingStrategy(SimpleStrategy):
     """
     Simple strategy that walks bid prices up and down: 1c -> 2c -> 3c -> 2c -> 1c...
-    
+
     This demonstrates order placement and cancellation flow.
     Always places exactly 1 bid order at the current price level.
     """
-    
+
     def __init__(self):
         self._tick_count = 0
         # Price levels to walk: 1c, 2c, 3c, 2c, 1c, 2c, 3c...
         self._price_sequence = [0.01, 0.02, 0.03, 0.02]  # Repeating pattern
         self._last_targets: TargetQuotes = None
-    
+
     @property
     def current_price(self) -> float:
         """Current price in the walking sequence."""
         idx = self._tick_count % len(self._price_sequence)
         return self._price_sequence[idx]
-    
+
     def compute_quotes(self, ctx: StrategyContext) -> TargetQuotes:
         """Place a bid at the current walking price."""
         self._tick_count += 1
-        
+
         price = self.current_price
-        
+
         self._last_targets = TargetQuotes(
             bid_price=price,
             bid_size=5.0,
             ask_price=None,  # No ask
             ask_size=0.0,
+        )
+        return self._last_targets
+
+
+class WorseSpreadStrategy(SimpleStrategy):
+    """
+    Strategy that places orders 2 cents WORSE than the current bid-ask spread.
+
+    - Posts YES buy (bid) 2 cents below market bid
+    - Posts NO buy to simulate YES sell (ask) at equivalent price 2 cents above market ask
+
+    This allows market making without needing to split USDC into shares upfront.
+    """
+
+    def __init__(self, worse_offset: float = 0.05, order_size: float = 5.0):
+        """
+        Initialize the worse spread strategy.
+
+        Args:
+            worse_offset: How much worse than market to quote (default 0.02 = 2 cents)
+            order_size: Size for each order (default 5.0)
+        """
+        self._worse_offset = worse_offset
+        self._order_size = order_size
+        self._last_targets: TargetQuotes = None
+
+    def compute_quotes(self, ctx: StrategyContext) -> TargetQuotes:
+        """
+        Compute quotes 2 cents worse than market bid/ask.
+
+        YES bid: market_bid - 0.02 (buying YES below market)
+        NO bid: 1 - (market_ask + 0.02) (buying NO, equivalent to selling YES above market)
+        """
+        # Need market prices to compute quotes
+        if ctx.market_bid is None or ctx.market_ask is None:
+            return TargetQuotes()  # No quotes if market prices unavailable
+
+        # YES buy order: 2 cents worse than market bid (lower)
+        yes_bid_price = ctx.market_bid - self._worse_offset
+
+        # NO buy order: simulates YES sell 2 cents worse than market ask (higher)
+        # If market ask for YES is X, we want to simulate selling YES at X + 0.02
+        # Buying NO at price P is equivalent to selling YES at (1 - P)
+        # So we want: 1 - P = X + 0.02, which means P = 1 - (X + 0.02)
+        no_bid_price = 1.0 - (ctx.market_ask + self._worse_offset)
+
+        # Clamp prices to valid range [0.01, 0.99]
+        yes_bid_price = max(0.01, min(0.99, yes_bid_price))
+        no_bid_price = max(0.01, min(0.99, no_bid_price))
+
+        self._last_targets = TargetQuotes(
+            bid_price=yes_bid_price,
+            bid_size=self._order_size,
+            ask_price=no_bid_price,  # This is actually a NO buy, not a YES sell
+            ask_size=self._order_size,
         )
         return self._last_targets
 
@@ -253,6 +315,59 @@ def build_open_orders_dict(state_view: CanonicalStateView) -> dict[str, OpenOrde
     return result
 
 
+class DualTokenExecutor(SimpleExecutor):
+    """
+    Extended executor that can place orders on both YES and NO tokens.
+
+    - bid_price (from TargetQuotes) -> BUY order on YES token
+    - ask_price (from TargetQuotes) -> BUY order on NO token (simulating YES sell)
+
+    This allows market making without splitting USDC upfront.
+    """
+
+    async def _place(self, side: Side, price: float, size: float, now_ms: int) -> None:
+        """
+        Fire a place request.
+
+        Overrides parent to use:
+        - YES token for BUY side (bid)
+        - NO token for SELL side (which we interpret as NO buy)
+        """
+        self.places_sent += 1
+
+        try:
+            expires_at_ms = now_ms + self.default_ttl_ms
+
+            # Determine which token to use based on side
+            # BUY = YES token buy (normal bid)
+            # SELL = NO token buy (simulating YES sell)
+            if side == Side.BUY:
+                token_id = self.yes_token_id
+                actual_side = Side.BUY
+            else:  # Side.SELL
+                token_id = self.no_token_id
+                actual_side = Side.BUY  # We're buying NO, not selling YES
+
+            request = OrderRequest(
+                client_req_id=f"{now_ms}_{side.name}",
+                token_id=token_id,
+                side=actual_side,  # Always BUY in this strategy
+                price=price,
+                size=size,
+                expires_at_ms=expires_at_ms,
+            )
+
+            result = await self.rest.place_order(request)
+
+            if not result.success:
+                self.place_failures += 1
+                logger.warning(f"Place failed: {result.error_msg} [{side.name} {size:.0f} @ ${price:.2f}]")
+
+        except Exception as e:
+            self.place_failures += 1
+            logger.warning(f"Place request failed: {e}")
+
+
 # =============================================================================
 # TEST APP WRAPPERS WITH DISPLAY
 # =============================================================================
@@ -286,12 +401,16 @@ class TestContainerBApp(ContainerBApp):
     def _setup_components(self) -> None:
         super()._setup_components()
         # Create and store the strategy
-        self._strategy_instance = WalkingStrategy()
-        
+        # Switch to WorseSpreadStrategy for the 2 cents worse strategy
+        self._strategy_instance = WorseSpreadStrategy(
+            worse_offset=0.05,  # 2 cents worse
+            order_size=5.0,     # 5 unit orders
+        )
+
         # Create simple executor (after rest client is set up)
         # We'll set it up after super()._setup_components() completes
         # But we need to wait for rest client, so do it in a custom method
-        
+
         # Create custom decision loop with display
         self.decision_loop = DisplayDecisionLoop(
             tick_hz=self.config.poll_snapshot_hz,
@@ -311,10 +430,10 @@ class TestContainerBApp(ContainerBApp):
         # Wait a bit for market to be selected and state to stabilize
         await asyncio.sleep(1)
         
-        # Now create simple executor with token IDs
+        # Now create dual token executor with token IDs
         state_view = self.state.view()
         if state_view.token_ids:
-            self._simple_executor = SimpleExecutor(
+            self._simple_executor = DualTokenExecutor(
                 rest=self.rest,
                 yes_token_id=state_view.token_ids.yes_token_id,
                 no_token_id=state_view.token_ids.no_token_id or "",
@@ -605,7 +724,7 @@ class ProductionE2ETest:
             )
         
         return BConfig(
-            poll_snapshot_hz=2,  # 2 Hz = 500ms per tick
+            poll_snapshot_hz=5,  # 5 Hz = 200ms per tick
             snapshot_url="http://127.0.0.1:8080/snapshot/latest",
             market_slug=market_slug,
             pm_private_key=pm_private_key,
@@ -645,11 +764,13 @@ class ProductionE2ETest:
         try:
             # Print header
             print("\n" + "=" * 60)
-            print(" HOURMM E2E TEST - Walking Strategy Demo")
+            print(" HOURMM E2E TEST - Worse Spread Strategy Demo")
             print("=" * 60)
             print()
-            print(" Strategy: Walks bid price 1c -> 2c -> 3c -> 2c -> 1c...")
-            print(" Frequency: 2 Hz (500ms per tick)")
+            print(" Strategy: Places orders 2 cents WORSE than market")
+            print("   - YES buy:  market_bid - $0.02")
+            print("   - NO buy:   simulating YES sell at market_ask + $0.02")
+            print(" Frequency: 5 Hz (200ms per tick)")
             print()
             print(" Press Ctrl+C to stop")
             print()
