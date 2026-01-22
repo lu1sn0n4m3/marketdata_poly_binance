@@ -1,4 +1,4 @@
-# Docker Compose for Marketdata Collector + Uploader
+# Docker Compose for Marketdata Collector + Uploader + HourMM Trading System
 #
 # Deployment on VPS:
 #   1. Clone repo to /home/luis/marketdata/repo
@@ -6,6 +6,7 @@
 #   3. Run: docker compose up -d
 #
 # Data is stored in a named volume 'marketdata' mounted at /data in both containers.
+# HourMM journal data stored in 'hourmm_journal' volume.
 
 services:
   collector:
@@ -23,7 +24,6 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-    # No network needed for collector (uses websockets directly)
     networks:
       - default
 
@@ -47,6 +47,92 @@ services:
     networks:
       - default
 
+  # ============================================
+  # HourMM Trading System
+  # ============================================
+
+  # Container A: Binance Pricer
+  # Ingests Binance data, computes features, produces fair prices
+  binance_pricer:
+    build:
+      context: .
+      dockerfile: services/binance_pricer/Dockerfile
+    container_name: hourmm-binance-pricer
+    restart: unless-stopped
+    environment:
+      - BINANCE_SYMBOL=BTCUSDT
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8080
+      - STALE_THRESHOLD_MS=500
+      - SNAPSHOT_PUBLISH_HZ=50
+      - LOG_LEVEL=INFO
+    ports:
+      # Internal only - not exposed to host
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - hourmm
+
+  # Container B: Polymarket Trader
+  # Trading logic, risk management, order execution
+  polymarket_trader:
+    build:
+      context: .
+      dockerfile: services/polymarket_trader/Dockerfile
+    container_name: hourmm-polymarket-trader
+    restart: unless-stopped
+    volumes:
+      - hourmm_journal:/data
+    environment:
+      - POLL_SNAPSHOT_HZ=50
+      - SNAPSHOT_URL=http://binance_pricer:8080/snapshot/latest
+      - GAMMA_API_URL=https://gamma-api.polymarket.com
+      - MARKET_SLUG=bitcoin-btc-price-on-january-31
+      - SQLITE_PATH=/data/journal.db
+      - CONTROL_HOST=0.0.0.0
+      - CONTROL_PORT=9000
+      - LOG_LEVEL=INFO
+      # Risk limits (adjust as needed)
+      - MAX_RESERVED_CAPITAL=1000.0
+      - MAX_POSITION_SIZE=500.0
+      - MAX_ORDER_SIZE=100.0
+      - MAX_OPEN_ORDERS=4
+      # Session timers (in ms)
+      - T_WIND_MS=600000
+      - T_FLATTEN_MS=300000
+      - HARD_CUTOFF_MS=60000
+    env_file:
+      - ./deploy/prod.env  # For PM_API_KEY, PM_API_SECRET, PM_PASSPHRASE, PM_PRIVATE_KEY
+    ports:
+      # Control plane - bind to localhost only for operator access
+      - "127.0.0.1:9000:9000"
+    depends_on:
+      binance_pricer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - hourmm
+
 volumes:
   marketdata:
     driver: local
@@ -55,7 +141,15 @@ volumes:
     #   type: none
     #   o: bind
     #   device: /home/luis/marketdata/data
+  
+  # HourMM journal volume for SQLite persistence
+  hourmm_journal:
+    driver: local
 
 networks:
   default:
+    driver: bridge
+  
+  # Dedicated network for HourMM containers
+  hourmm:
     driver: bridge
