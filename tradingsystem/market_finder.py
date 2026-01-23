@@ -1,8 +1,11 @@
 """
 Bitcoin Hourly Market Finder for Polymarket.
 
-Finds the current Bitcoin hourly market based on time zone handling
-(markets use Eastern Time) and market structure matching.
+Finds the current Bitcoin hourly market by constructing the slug directly
+from the current time. Markets use Eastern Time and follow the pattern:
+"bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et"
+
+Example: bitcoin-up-or-down-january-23-1pm-et
 """
 
 import re
@@ -19,6 +22,12 @@ logger = logging.getLogger(__name__)
 # Eastern Time zone
 ET = ZoneInfo("America/New_York")
 
+# Month names for slug construction
+MONTH_NAMES = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december"
+]
+
 
 def get_current_hour_et() -> datetime:
     """Get current hour boundary in Eastern Time."""
@@ -27,7 +36,7 @@ def get_current_hour_et() -> datetime:
 
 
 def get_next_hour_et() -> datetime:
-    """Get next hour boundary in Eastern Time."""
+    """Get next hour boundary in Eastern Time (market resolution time)."""
     current = get_current_hour_et()
     return current + timedelta(hours=1)
 
@@ -40,6 +49,54 @@ def get_target_end_time() -> datetime:
     E.g., the 12pm market ends at 1pm.
     """
     return get_next_hour_et()
+
+
+def build_market_slug(target_time: Optional[datetime] = None) -> str:
+    """
+    Build the market slug for the current (or specified) hour.
+
+    The slug format is: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+
+    Examples:
+    - bitcoin-up-or-down-january-23-1pm-et
+    - bitcoin-up-or-down-february-14-12pm-et
+    - bitcoin-up-or-down-march-5-9am-et
+
+    Args:
+        target_time: The market resolution time (defaults to next hour ET)
+
+    Returns:
+        The market slug string
+    """
+    if target_time is None:
+        target_time = get_next_hour_et()
+
+    # Ensure we're working in ET
+    if target_time.tzinfo is None:
+        target_time = target_time.replace(tzinfo=ET)
+    else:
+        target_time = target_time.astimezone(ET)
+
+    month = MONTH_NAMES[target_time.month - 1]
+    day = target_time.day
+    hour_24 = target_time.hour
+
+    # Convert to 12-hour format
+    if hour_24 == 0:
+        hour_12 = 12
+        period = "am"
+    elif hour_24 < 12:
+        hour_12 = hour_24
+        period = "am"
+    elif hour_24 == 12:
+        hour_12 = 12
+        period = "pm"
+    else:
+        hour_12 = hour_24 - 12
+        period = "pm"
+
+    slug = f"bitcoin-up-or-down-{month}-{day}-{hour_12}{period}-et"
+    return slug
 
 
 def parse_market_end_time(end_date_str: str) -> datetime:
@@ -76,41 +133,17 @@ def extract_reference_price(question: str) -> Optional[float]:
     return None
 
 
-def extract_hour_from_question(question: str) -> Optional[int]:
-    """
-    Extract the hour from a market question.
-
-    Examples:
-    - "... at 12:00 PM ET" -> 12
-    - "... at 3:00 AM ET" -> 3
-    """
-    # Pattern matches times like "12:00 PM" or "3:00 AM"
-    pattern = r"(\d{1,2}):00\s*(AM|PM|am|pm)"
-    match = re.search(pattern, question)
-    if match:
-        hour = int(match.group(1))
-        period = match.group(2).upper()
-        if period == "PM" and hour != 12:
-            hour += 12
-        elif period == "AM" and hour == 12:
-            hour = 0
-        return hour
-    return None
-
-
 class BitcoinHourlyMarketFinder:
     """
     Finds the current Bitcoin hourly market on Polymarket.
 
     Strategy:
-    1. Search for "bitcoin" markets
-    2. Filter by end time matching current hour
-    3. Extract YES/NO token IDs
-    """
+    1. Construct the slug directly from current time
+    2. Fetch the event by slug from Gamma API
+    3. Extract YES/NO token IDs from the market
 
-    # Keywords that identify Bitcoin hourly markets
-    BITCOIN_KEYWORDS = ["btc", "bitcoin"]
-    HOURLY_KEYWORDS = ["hourly", "hour", "pm et", "am et"]
+    The slug format is: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+    """
 
     def __init__(self, gamma: GammaClient):
         """
@@ -125,112 +158,83 @@ class BitcoinHourlyMarketFinder:
         """
         Find the Bitcoin hourly market for the current hour.
 
-        Tries multiple strategies:
-        1. Search for "bitcoin hourly"
-        2. Search for "btc"
-        3. Browse active events
+        Constructs the slug directly and fetches from Gamma API.
 
         Returns:
             MarketInfo or None if not found
         """
-        target_end = get_target_end_time()
-        target_hour = get_current_hour_et().hour
-        logger.info(
-            f"Searching for Bitcoin market ending at {target_end.strftime('%Y-%m-%d %H:%M %Z')} "
-            f"(hour {target_hour})"
-        )
+        target_time = get_next_hour_et()
+        slug = build_market_slug(target_time)
 
-        # Strategy 1: Search for "bitcoin hourly"
+        logger.info(f"Looking for market with slug: {slug}")
+        logger.info(f"  Target resolution time: {target_time.strftime('%Y-%m-%d %H:%M %Z')}")
+
         try:
-            markets = await self._gamma.search_markets("bitcoin hourly", limit=100)
-            logger.debug(f"Search 'bitcoin hourly' returned {len(markets)} markets")
-            for market in markets:
-                if self._is_matching_market(market, target_end, target_hour):
-                    return self._parse_market(market)
+            # Try to get the event by slug
+            event = await self._gamma.get_event_by_slug(slug)
+
+            if event is None:
+                logger.warning(f"No event found for slug: {slug}")
+                return None
+
+            # The event contains markets - get the first (usually only one for binary)
+            markets = event.get("markets", [])
+            if not markets:
+                # Try getting markets separately
+                event_id = event.get("id")
+                if event_id:
+                    markets = await self._gamma.get_markets_for_event(str(event_id))
+
+            if not markets:
+                logger.warning(f"No markets found in event: {slug}")
+                return None
+
+            # Use the first market (binary events typically have one market)
+            market = markets[0]
+            return self._parse_market(market, event)
+
         except GammaAPIError as e:
-            logger.warning(f"Search 'bitcoin hourly' failed: {e}")
+            logger.error(f"Failed to fetch market for slug {slug}: {e}")
+            return None
 
-        # Strategy 2: Search for "btc"
-        try:
-            markets = await self._gamma.search_markets("btc", limit=100)
-            logger.debug(f"Search 'btc' returned {len(markets)} markets")
-            for market in markets:
-                if self._is_matching_market(market, target_end, target_hour):
-                    return self._parse_market(market)
-        except GammaAPIError as e:
-            logger.warning(f"Search 'btc' failed: {e}")
-
-        # Strategy 3: Browse active events
-        try:
-            events = await self._gamma.get_active_events(limit=200)
-            logger.debug(f"Active events returned {len(events)} events")
-            for event in events:
-                title = (event.get("title") or "").lower()
-                if any(kw in title for kw in self.BITCOIN_KEYWORDS):
-                    # Get markets for this event
-                    event_id = event.get("id")
-                    if event_id:
-                        markets = await self._gamma.get_markets_for_event(str(event_id))
-                        for market in markets:
-                            if self._is_matching_market(market, target_end, target_hour):
-                                return self._parse_market(market)
-        except GammaAPIError as e:
-            logger.warning(f"Browse events failed: {e}")
-
-        logger.warning(f"No Bitcoin market found for {target_end}")
-        return None
-
-    def _is_matching_market(
-        self,
-        market: dict,
-        target_end: datetime,
-        target_hour: int,
-    ) -> bool:
+    async def find_market_for_time(self, target_time: datetime) -> Optional[MarketInfo]:
         """
-        Check if a market matches our criteria.
+        Find a Bitcoin market for a specific time.
 
-        Criteria:
-        - Not closed
-        - End time matches target (within tolerance)
-        - Question contains bitcoin/btc keywords
-        - Question contains hour indicator
+        Args:
+            target_time: The market resolution time
+
+        Returns:
+            MarketInfo or None if not found
         """
-        # Must not be closed
-        if market.get("closed", True):
-            return False
-
-        # Must be active
-        if not market.get("active", True):
-            return False
-
-        # Check end time
-        end_date_str = market.get("endDate")
-        if not end_date_str:
-            return False
+        slug = build_market_slug(target_time)
+        logger.info(f"Looking for market with slug: {slug}")
 
         try:
-            market_end = parse_market_end_time(end_date_str)
-            # Allow 5 minute tolerance for end time matching
-            diff_seconds = abs((market_end - target_end).total_seconds())
-            if diff_seconds > 300:
-                return False
-        except Exception as e:
-            logger.debug(f"Failed to parse end time: {e}")
-            return False
+            event = await self._gamma.get_event_by_slug(slug)
 
-        # Check question contains bitcoin keywords
-        question = (market.get("question") or "").lower()
-        if not any(kw in question for kw in self.BITCOIN_KEYWORDS):
-            return False
+            if event is None:
+                logger.warning(f"No event found for slug: {slug}")
+                return None
 
-        # Check question mentions the hour (optional but helpful)
-        question_hour = extract_hour_from_question(market.get("question", ""))
-        if question_hour is not None and question_hour != target_hour:
-            return False
+            markets = event.get("markets", [])
+            if not markets:
+                event_id = event.get("id")
+                if event_id:
+                    markets = await self._gamma.get_markets_for_event(str(event_id))
 
-        return True
+            if not markets:
+                logger.warning(f"No markets found in event: {slug}")
+                return None
 
-    def _parse_market(self, market: dict) -> MarketInfo:
+            market = markets[0]
+            return self._parse_market(market, event)
+
+        except GammaAPIError as e:
+            logger.error(f"Failed to fetch market for slug {slug}: {e}")
+            return None
+
+    def _parse_market(self, market: dict, event: Optional[dict] = None) -> MarketInfo:
         """
         Parse market data into MarketInfo.
 
@@ -253,7 +257,7 @@ class BitcoinHourlyMarketFinder:
             # Try clobTokenIds format
             clob_ids = market.get("clobTokenIds")
             if clob_ids and len(clob_ids) >= 2:
-                # Usually first is YES, second is NO
+                # First is YES, second is NO
                 yes_token = {"token_id": clob_ids[0]}
                 no_token = {"token_id": clob_ids[1]}
             else:
@@ -261,6 +265,9 @@ class BitcoinHourlyMarketFinder:
 
         # Parse end time
         end_date_str = market.get("endDate", "")
+        if not end_date_str and event:
+            end_date_str = event.get("endDate", "")
+
         try:
             market_end = parse_market_end_time(end_date_str)
             end_time_utc_ms = int(market_end.astimezone(timezone.utc).timestamp() * 1000)
@@ -268,12 +275,20 @@ class BitcoinHourlyMarketFinder:
             end_time_utc_ms = 0
 
         # Extract reference price from question
-        reference_price = extract_reference_price(market.get("question", ""))
+        question = market.get("question", "")
+        if not question and event:
+            question = event.get("title", "")
+        reference_price = extract_reference_price(question)
+
+        # Get slug
+        slug = market.get("slug", "")
+        if not slug and event:
+            slug = event.get("slug", "")
 
         return MarketInfo(
             condition_id=market.get("conditionId") or market.get("condition_id") or "",
-            question=market.get("question", ""),
-            slug=market.get("slug", ""),
+            question=question,
+            slug=slug,
             yes_token_id=yes_token.get("token_id", ""),
             no_token_id=no_token.get("token_id", ""),
             end_time_utc_ms=end_time_utc_ms,
@@ -306,6 +321,7 @@ class MarketScheduler:
             transition_lead_time_ms: Stop trading this many ms before hour end
         """
         self._finder = BitcoinHourlyMarketFinder(gamma)
+        self._gamma = gamma
         self._on_market_change = on_market_change
         self._lead_time_ms = transition_lead_time_ms
 
@@ -325,11 +341,13 @@ class MarketScheduler:
             self._last_check_hour = datetime.now(ET).hour
 
             logger.info(f"Selected market: {market.question}")
+            logger.info(f"  Slug: {market.slug}")
             logger.info(f"  Condition ID: {market.condition_id}")
             logger.info(f"  YES token: {market.yes_token_id}")
             logger.info(f"  NO token: {market.no_token_id}")
             if market.reference_price:
                 logger.info(f"  Reference price: ${market.reference_price:,.2f}")
+            logger.info(f"  Time remaining: {market.time_remaining_ms / 1000:.0f}s")
 
             if self._on_market_change:
                 await self._on_market_change(market)
