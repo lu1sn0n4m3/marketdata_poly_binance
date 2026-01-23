@@ -64,11 +64,11 @@ class TestBuildMarketSlug:
         slug = build_market_slug(target)
         assert slug == "bitcoin-up-or-down-november-15-11am-et"
 
-    def test_slug_uses_next_hour_by_default(self):
-        """Test that slug defaults to next hour."""
+    def test_slug_uses_current_hour_by_default(self):
+        """Test that slug defaults to current hour (market start time)."""
         slug = build_market_slug()
-        next_hour = get_next_hour_et()
-        expected = build_market_slug(next_hour)
+        current_hour = get_current_hour_et()
+        expected = build_market_slug(current_hour)
         assert slug == expected
 
 
@@ -143,9 +143,10 @@ class TestBitcoinHourlyMarketFinder:
     @pytest.mark.asyncio
     async def test_find_current_market_success(self, finder, mock_gamma):
         """Test finding market successfully."""
-        # Build the expected slug
-        target_time = get_next_hour_et()
-        expected_slug = build_market_slug(target_time)
+        # Build the expected slug using current hour (market start time)
+        start_time = get_current_hour_et()
+        end_time = get_next_hour_et()
+        expected_slug = build_market_slug(start_time)
 
         mock_event = {
             "id": "123",
@@ -155,7 +156,7 @@ class TestBitcoinHourlyMarketFinder:
                 "conditionId": "0xabc123",
                 "question": "Will BTC be above $100,000?",
                 "slug": expected_slug,
-                "endDate": target_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endDate": end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "clobTokenIds": ["yes_token_123", "no_token_456"],
             }],
         }
@@ -181,8 +182,9 @@ class TestBitcoinHourlyMarketFinder:
     @pytest.mark.asyncio
     async def test_find_market_with_tokens_array(self, finder, mock_gamma):
         """Test parsing market with tokens array format."""
-        target_time = get_next_hour_et()
-        expected_slug = build_market_slug(target_time)
+        start_time = get_current_hour_et()
+        end_time = get_next_hour_et()
+        expected_slug = build_market_slug(start_time)
 
         mock_event = {
             "id": "123",
@@ -190,7 +192,7 @@ class TestBitcoinHourlyMarketFinder:
             "markets": [{
                 "conditionId": "0xdef456",
                 "question": "Will BTC be above $105,000?",
-                "endDate": target_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endDate": end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "tokens": [
                     {"token_id": "yes_from_tokens", "outcome": "Yes"},
                     {"token_id": "no_from_tokens", "outcome": "No"},
@@ -227,8 +229,9 @@ class TestMarketScheduler:
     @pytest.mark.asyncio
     async def test_select_market_for_now(self, scheduler, mock_gamma):
         """Test selecting market for current hour."""
-        target_time = get_next_hour_et()
-        expected_slug = build_market_slug(target_time)
+        start_time = get_current_hour_et()
+        end_time = get_next_hour_et()
+        expected_slug = build_market_slug(start_time)
 
         mock_event = {
             "id": "123",
@@ -236,7 +239,7 @@ class TestMarketScheduler:
             "markets": [{
                 "conditionId": "0xabc123",
                 "question": "Will BTC be above $100,000?",
-                "endDate": target_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endDate": end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "clobTokenIds": ["yes_token", "no_token"],
             }],
         }

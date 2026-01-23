@@ -1,13 +1,14 @@
 """
 Base WebSocket client utilities for threaded connections.
 
-Uses websocket-client for blocking/threaded WebSocket operations.
+Uses websocket-client WebSocketApp for proper event-driven WebSocket handling.
 """
 
 import logging
 import random
 import threading
-from typing import Optional, Callable
+import time
+from typing import Optional
 from abc import ABC, abstractmethod
 
 import websocket
@@ -42,11 +43,8 @@ class ThreadedWsClient(ABC):
     """
     Base class for threaded WebSocket clients.
 
-    Provides:
-    - Connection management with exponential backoff
-    - Run loop in dedicated thread
-    - Stop signal handling
-    - Reconnection logic
+    Uses WebSocketApp for proper event-driven handling with automatic
+    ping/pong and reconnection support.
     """
 
     def __init__(
@@ -62,12 +60,16 @@ class ThreadedWsClient(ABC):
         self._ping_timeout = ping_timeout
 
         # Connection state
-        self._ws: Optional[websocket.WebSocket] = None
+        self._ws: Optional[websocket.WebSocketApp] = None
         self._connected = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._backoff = ExponentialBackoff()
         self._reconnect_count = 0
+
+        # Message queue for sending (thread-safe)
+        self._send_queue: list[bytes] = []
+        self._send_lock = threading.Lock()
 
     @property
     def connected(self) -> bool:
@@ -117,70 +119,74 @@ class ThreadedWsClient(ABC):
         """Main run loop with reconnection."""
         while not self._stop_event.is_set():
             try:
-                self._connect_and_listen()
-            except websocket.WebSocketException as e:
-                if not self._stop_event.is_set():
-                    self._connected = False
-                    self._reconnect_count += 1
-                    delay = self._backoff.next_delay()
-                    logger.warning(f"{self._name}: Disconnected ({e}), reconnecting in {delay:.1f}s")
-                    self._on_disconnect()
-                    self._stop_event.wait(timeout=delay)
+                self._connect_and_run()
             except Exception as e:
                 if not self._stop_event.is_set():
                     logger.error(f"{self._name}: Error: {e}")
-                    self._on_disconnect()
-                    self._stop_event.wait(timeout=1.0)
+
+            if not self._stop_event.is_set():
+                self._connected = False
+                self._reconnect_count += 1
+                delay = self._backoff.next_delay()
+                logger.warning(f"{self._name}: Reconnecting in {delay:.1f}s")
+                self._on_disconnect()
+                self._stop_event.wait(timeout=delay)
 
         logger.info(f"{self._name}: Run loop exited")
 
-    def _connect_and_listen(self) -> None:
-        """Connect and process messages."""
+    def _connect_and_run(self) -> None:
+        """Create WebSocketApp and run it."""
         logger.info(f"{self._name}: Connecting to {self._ws_url[:60]}...")
 
-        self._ws = websocket.WebSocket()
-        self._ws.settimeout(self._ping_timeout)
-
-        self._ws.connect(
+        self._ws = websocket.WebSocketApp(
             self._ws_url,
+            on_open=self._ws_on_open,
+            on_message=self._ws_on_message,
+            on_error=self._ws_on_error,
+            on_close=self._ws_on_close,
+            on_ping=self._ws_on_ping,
+        )
+
+        # run_forever blocks until connection closes
+        # Note: websocket-client requires ping_interval > ping_timeout
+        # We use ping_interval for keepalive, ping_timeout=10 for response wait
+        self._ws.run_forever(
+            ping_interval=self._ping_interval,
+            ping_timeout=10,
             skip_utf8_validation=True,
         )
 
+    def _ws_on_open(self, ws) -> None:
+        """WebSocketApp open callback."""
+        logger.info(f"{self._name}: Connected")
         self._connected = True
         self._backoff.reset()
-        logger.info(f"{self._name}: Connected")
 
         # Send subscription
         self._subscribe()
         self._on_connect()
 
-        # Message loop
-        while not self._stop_event.is_set():
-            try:
-                # Use timeout to check stop event periodically
-                self._ws.settimeout(1.0)
-                opcode, data = self._ws.recv_data(control_frame=True)
+    def _ws_on_message(self, ws, message) -> None:
+        """WebSocketApp message callback."""
+        # Message can be str or bytes
+        if isinstance(message, str):
+            message = message.encode('utf-8')
+        self._handle_message(message)
 
-                if opcode == websocket.ABNF.OPCODE_CLOSE:
-                    logger.info(f"{self._name}: Received close frame")
-                    break
-                elif opcode == websocket.ABNF.OPCODE_PING:
-                    self._ws.pong(data)
-                elif opcode in (websocket.ABNF.OPCODE_TEXT, websocket.ABNF.OPCODE_BINARY):
-                    self._handle_message(data)
+    def _ws_on_error(self, ws, error) -> None:
+        """WebSocketApp error callback."""
+        if not self._stop_event.is_set():
+            logger.warning(f"{self._name}: WebSocket error: {error}")
 
-            except websocket.WebSocketTimeoutException:
-                # Timeout is expected, just check stop event
-                continue
-            except websocket.WebSocketConnectionClosedException:
-                logger.info(f"{self._name}: Connection closed")
-                break
-
+    def _ws_on_close(self, ws, close_status_code, close_msg) -> None:
+        """WebSocketApp close callback."""
         self._connected = False
-        try:
-            self._ws.close()
-        except Exception:
-            pass
+        if not self._stop_event.is_set():
+            logger.info(f"{self._name}: Connection closed (code={close_status_code})")
+
+    def _ws_on_ping(self, ws, message) -> None:
+        """WebSocketApp ping callback - pong is automatic."""
+        pass  # WebSocketApp handles pong automatically
 
     @abstractmethod
     def _subscribe(self) -> None:
@@ -203,4 +209,7 @@ class ThreadedWsClient(ABC):
     def _send(self, data: bytes) -> None:
         """Send data to WebSocket."""
         if self._ws and self._connected:
-            self._ws.send(data)
+            try:
+                self._ws.send(data)
+            except Exception as e:
+                logger.warning(f"{self._name}: Send error: {e}")

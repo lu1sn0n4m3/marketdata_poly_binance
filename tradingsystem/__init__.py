@@ -69,6 +69,15 @@ from .snapshot_store import LatestSnapshotStore
 from .pm_cache import PMCache
 from .bn_cache import BNCache
 
+# WebSocket clients
+from .ws_base import ExponentialBackoff, ThreadedWsClient
+from .pm_market_ws import PolymarketMarketWsClient, PM_MARKET_WS_URL
+from .pm_user_ws import PolymarketUserWsClient, PM_USER_WS_URL
+
+# REST client and Gateway
+from .pm_rest_client import PolymarketRestClient, OrderResult, CancelResult, OrderType
+from .gateway import Gateway, GatewayWorker, GatewayStats
+
 __all__ = [
     # Version
     "__version__",
@@ -127,4 +136,19 @@ __all__ = [
     "LatestSnapshotStore",
     "PMCache",
     "BNCache",
+    # WebSocket clients
+    "ExponentialBackoff",
+    "ThreadedWsClient",
+    "PolymarketMarketWsClient",
+    "PM_MARKET_WS_URL",
+    "PolymarketUserWsClient",
+    "PM_USER_WS_URL",
+    # REST client and Gateway
+    "PolymarketRestClient",
+    "OrderResult",
+    "CancelResult",
+    "OrderType",
+    "Gateway",
+    "GatewayWorker",
+    "GatewayStats",
 ]

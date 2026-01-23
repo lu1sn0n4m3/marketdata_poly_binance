@@ -343,13 +343,9 @@ class RealOrderSpec:
     side: Side
     px: int            # Price in cents
     sz: int            # Size in shares
+    token_id: str = ""  # Actual token ID for the exchange
     time_in_force: str = "GTC"
     client_order_id: str = ""
-
-    @property
-    def token_id(self) -> str:
-        """Placeholder - actual token ID set by executor."""
-        return ""
 
     def matches(self, other: "RealOrderSpec", price_tol: int = 0, size_tol: int = 5) -> bool:
         """Check if this order matches another within tolerance."""
@@ -407,7 +403,8 @@ class GatewayAction:
     action_type: GatewayActionType
     action_id: str
     order_spec: Optional[RealOrderSpec] = None  # For PLACE
-    client_order_id: Optional[str] = None       # For CANCEL
+    client_order_id: Optional[str] = None       # For CANCEL (our ID)
+    server_order_id: Optional[str] = None       # For CANCEL (exchange ID)
     market_id: Optional[str] = None             # For CANCEL_ALL
 
 

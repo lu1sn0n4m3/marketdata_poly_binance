@@ -9,6 +9,7 @@ Example: bitcoin-up-or-down-january-23-1pm-et
 """
 
 import re
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Callable, Awaitable
@@ -57,19 +58,22 @@ def build_market_slug(target_time: Optional[datetime] = None) -> str:
 
     The slug format is: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
 
+    The hour in the slug is the MARKET START hour. The "1pm" market
+    starts at 1pm and resolves at 2pm.
+
     Examples:
-    - bitcoin-up-or-down-january-23-1pm-et
-    - bitcoin-up-or-down-february-14-12pm-et
-    - bitcoin-up-or-down-march-5-9am-et
+    - bitcoin-up-or-down-january-23-1pm-et (starts 1pm, ends 2pm)
+    - bitcoin-up-or-down-february-14-12pm-et (starts 12pm, ends 1pm)
+    - bitcoin-up-or-down-march-5-9am-et (starts 9am, ends 10am)
 
     Args:
-        target_time: The market resolution time (defaults to next hour ET)
+        target_time: The market START time (defaults to current hour ET)
 
     Returns:
         The market slug string
     """
     if target_time is None:
-        target_time = get_next_hour_et()
+        target_time = get_current_hour_et()
 
     # Ensure we're working in ET
     if target_time.tzinfo is None:
@@ -159,15 +163,17 @@ class BitcoinHourlyMarketFinder:
         Find the Bitcoin hourly market for the current hour.
 
         Constructs the slug directly and fetches from Gamma API.
+        The market slug uses the START hour (e.g., "1pm" market starts at 1pm, ends at 2pm).
 
         Returns:
             MarketInfo or None if not found
         """
-        target_time = get_next_hour_et()
-        slug = build_market_slug(target_time)
+        start_time = get_current_hour_et()
+        end_time = get_next_hour_et()
+        slug = build_market_slug(start_time)
 
         logger.info(f"Looking for market with slug: {slug}")
-        logger.info(f"  Target resolution time: {target_time.strftime('%Y-%m-%d %H:%M %Z')}")
+        logger.info(f"  Market window: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M %Z')}")
 
         try:
             # Try to get the event by slug
@@ -254,13 +260,17 @@ class BitcoinHourlyMarketFinder:
                 no_token = token
 
         if not yes_token or not no_token:
-            # Try clobTokenIds format
+            # Try clobTokenIds format (may be JSON string or list)
             clob_ids = market.get("clobTokenIds")
-            if clob_ids and len(clob_ids) >= 2:
-                # First is YES, second is NO
-                yes_token = {"token_id": clob_ids[0]}
-                no_token = {"token_id": clob_ids[1]}
-            else:
+            if clob_ids:
+                # Parse if it's a JSON string
+                if isinstance(clob_ids, str):
+                    clob_ids = json.loads(clob_ids)
+                if len(clob_ids) >= 2:
+                    # First is YES, second is NO
+                    yes_token = {"token_id": clob_ids[0]}
+                    no_token = {"token_id": clob_ids[1]}
+            if not yes_token or not no_token:
                 raise ValueError(f"Market missing YES/NO tokens: {market.get('id')}")
 
         # Parse end time
