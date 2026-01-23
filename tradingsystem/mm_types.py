@@ -170,11 +170,21 @@ class BNSnapshot:
     Binance market data snapshot.
 
     Used for fair value estimation and shock detection.
+    Includes BBO, trade data, hour context, and derived features.
     """
     meta: MarketSnapshotMeta
     symbol: str
     best_bid_px: float
     best_ask_px: float
+
+    # Trade data
+    last_trade_price: Optional[float] = None
+    open_price: Optional[float] = None  # Hour open reference price
+
+    # Hour context
+    hour_start_ts_ms: int = 0
+    hour_end_ts_ms: int = 0
+    t_remaining_ms: int = 0
 
     # Derived features from feature engine (optional)
     return_1s: Optional[float] = None
@@ -198,6 +208,21 @@ class BNSnapshot:
         if self.p_yes is None:
             return None
         return max(1, min(99, int(self.p_yes * 100)))
+
+    @property
+    def price_vs_open(self) -> Optional[float]:
+        """Current price relative to hour open (as ratio)."""
+        if self.open_price is None or self.open_price == 0:
+            return None
+        return self.mid_px / self.open_price
+
+    @property
+    def return_from_open(self) -> Optional[float]:
+        """Return from hour open price."""
+        ratio = self.price_vs_open
+        if ratio is None:
+            return None
+        return ratio - 1.0
 
 
 # =============================================================================
