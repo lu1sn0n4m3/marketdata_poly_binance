@@ -171,46 +171,48 @@ class PolymarketMarketWsClient:
         """Parse a single event."""
         events: list[Event] = []
         event_type = data.get("event_type", "")
-        
+
+        # Extract token/asset ID - Polymarket sends this to identify which token
+        token_id = data.get("asset_id", "") or data.get("token_id", "")
+
         if event_type == "book":
             # Full book snapshot - extract BBO
             bids = data.get("bids", [])
             asks = data.get("asks", [])
-            
-            if bids and asks:
-                # Best bid/ask are last in arrays
+
+            if bids or asks:
+                # Best bid/ask are last in arrays (sorted ascending)
                 best_bid = float(bids[-1]["price"]) if bids else None
                 best_ask = float(asks[-1]["price"]) if asks else None
-                
+
                 events.append(MarketBboEvent(
                     event_type=None,
                     ts_local_ms=recv_ts_ms,
                     best_bid=best_bid,
                     best_ask=best_ask,
                     tick_size=self._current_tick_size,
+                    token_id=token_id,
                 ))
-        
+
         elif event_type == "price_change":
-            # Price update - extract BBO
+            # Price update - may contain updates for multiple tokens
             changes = data.get("price_changes", [])
-            best_bid = None
-            best_ask = None
-            
+
             for change in changes:
-                if change.get("best_bid") is not None:
-                    best_bid = float(change["best_bid"])
-                if change.get("best_ask") is not None:
-                    best_ask = float(change["best_ask"])
-            
-            if best_bid is not None or best_ask is not None:
-                events.append(MarketBboEvent(
-                    event_type=None,
-                    ts_local_ms=recv_ts_ms,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    tick_size=self._current_tick_size,
-                ))
-        
+                change_token_id = change.get("asset_id", "") or token_id
+                best_bid = change.get("best_bid")
+                best_ask = change.get("best_ask")
+
+                if best_bid is not None or best_ask is not None:
+                    events.append(MarketBboEvent(
+                        event_type=None,
+                        ts_local_ms=recv_ts_ms,
+                        best_bid=float(best_bid) if best_bid is not None else None,
+                        best_ask=float(best_ask) if best_ask is not None else None,
+                        tick_size=self._current_tick_size,
+                        token_id=change_token_id,
+                    ))
+
         elif event_type == "tick_size_change":
             # Tick size changed
             new_tick_size = data.get("tick_size")
@@ -221,20 +223,21 @@ class PolymarketMarketWsClient:
                     ts_local_ms=recv_ts_ms,
                     new_tick_size=self._current_tick_size,
                 ))
-        
+
         elif event_type == "best_bid_ask":
             # Direct BBO update
             best_bid = data.get("best_bid")
             best_ask = data.get("best_ask")
-            
+
             events.append(MarketBboEvent(
                 event_type=None,
                 ts_local_ms=recv_ts_ms,
                 best_bid=float(best_bid) if best_bid else None,
                 best_ask=float(best_ask) if best_ask else None,
                 tick_size=self._current_tick_size,
+                token_id=token_id,
             ))
-        
+
         return events
     
     async def run(self, shutdown_event: Optional[asyncio.Event] = None) -> None:

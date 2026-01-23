@@ -43,7 +43,7 @@ class MyStrategy(SimpleStrategy):
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import logging
 
@@ -58,58 +58,111 @@ logger = logging.getLogger(__name__)
 class StrategyContext:
     """
     Everything your strategy needs to make a decision.
-    
+
     All values are READ-ONLY and reflect the CURRENT state.
     Updated by WebSocket in real-time.
     """
     # Time
     now_ms: int                    # Current timestamp (ms)
     t_remaining_ms: int            # Time until hour end (ms)
-    
+
     # Your position (updated when fills happen via WS)
     position: float                # Net position in YES tokens (+ = long, - = short)
-    
-    # Market prices (from Polymarket WS)
-    market_bid: Optional[float]    # Best bid on Polymarket
-    market_ask: Optional[float]    # Best ask on Polymarket
+
+    # Market prices (from Polymarket WS) - legacy combined fields
+    market_bid: Optional[float]    # Best bid on Polymarket (legacy, may mix YES/NO)
+    market_ask: Optional[float]    # Best ask on Polymarket (legacy, may mix YES/NO)
     tick_size: float               # Minimum price increment (usually 0.01)
-    
+
+    # Separate YES/NO token market prices (recommended)
+    yes_market_bid: Optional[float] = None  # Best bid for YES token
+    yes_market_ask: Optional[float] = None  # Best ask for YES token
+    no_market_bid: Optional[float] = None   # Best bid for NO token
+    no_market_ask: Optional[float] = None   # Best ask for NO token
+
     # Fair price (from Binance pricer)
-    fair_price: Optional[float]    # Model's fair value for YES token
-    btc_price: Optional[float]     # Current BTC price
-    
+    fair_price: Optional[float] = None    # Model's fair value for YES token
+    btc_price: Optional[float] = None     # Current BTC price
+
     # Your current open orders (from WS)
-    open_bid_price: Optional[float]   # Your current bid price (if any)
-    open_bid_size: float              # Your current bid size
-    open_ask_price: Optional[float]   # Your current ask price (if any)  
-    open_ask_size: float              # Your current ask size
-    
+    open_bid_price: Optional[float] = None   # Your current bid price (if any)
+    open_bid_size: float = 0.0               # Your current bid size
+    open_ask_price: Optional[float] = None   # Your current ask price (if any)
+    open_ask_size: float = 0.0               # Your current ask size
+
     # Token info
-    yes_token_id: str              # Token ID for YES side
-    no_token_id: str               # Token ID for NO side
+    yes_token_id: str = ""              # Token ID for YES side
+    no_token_id: str = ""               # Token ID for NO side
+
+    # Separate YES/NO positions (for position-aware execution)
+    yes_position: float = 0.0           # YES token position (positive = holding YES)
+    no_position: float = 0.0            # NO token position (positive = holding NO)
 
 
 @dataclass
 class TargetQuotes:
     """
     Your strategy's desired quotes.
-    
-    Set price to None to NOT quote that side.
+
+    Supports multiple orders per side via dicts: {price: size}
     The executor will:
-      - Cancel any orders NOT matching these targets
-      - Place new orders to match these targets
+      - Cancel any orders NOT in the target dicts
+      - Place new orders to match the targets
+      - Keep existing orders that match
+
+    Example:
+        TargetQuotes(
+            bids={0.45: 10, 0.44: 5},   # Two bids at different prices
+            asks={0.55: 10, 0.56: 5},   # Two asks at different prices
+        )
     """
-    bid_price: Optional[float] = None   # Target bid price (or None to not bid)
-    bid_size: float = 0.0               # Target bid size
-    ask_price: Optional[float] = None   # Target ask price (or None to not ask)
-    ask_size: float = 0.0               # Target ask size
-    
+    bids: dict[float, float] = field(default_factory=dict)  # {price: size}
+    asks: dict[float, float] = field(default_factory=dict)  # {price: size}
+
     def __post_init__(self):
         """Validate prices are in valid range."""
-        if self.bid_price is not None:
-            self.bid_price = max(0.01, min(0.99, self.bid_price))
-        if self.ask_price is not None:
-            self.ask_price = max(0.01, min(0.99, self.ask_price))
+        self.bids = {
+            max(0.01, min(0.99, p)): s
+            for p, s in self.bids.items() if s > 0
+        }
+        self.asks = {
+            max(0.01, min(0.99, p)): s
+            for p, s in self.asks.items() if s > 0
+        }
+
+    # Convenience properties for single-order strategies
+    @property
+    def bid_price(self) -> Optional[float]:
+        """First bid price (for single-order compatibility)."""
+        return next(iter(self.bids.keys()), None) if self.bids else None
+
+    @property
+    def bid_size(self) -> float:
+        """First bid size (for single-order compatibility)."""
+        return next(iter(self.bids.values()), 0.0) if self.bids else 0.0
+
+    @property
+    def ask_price(self) -> Optional[float]:
+        """First ask price (for single-order compatibility)."""
+        return next(iter(self.asks.keys()), None) if self.asks else None
+
+    @property
+    def ask_size(self) -> float:
+        """First ask size (for single-order compatibility)."""
+        return next(iter(self.asks.values()), 0.0) if self.asks else 0.0
+
+    @classmethod
+    def single(
+        cls,
+        bid_price: Optional[float] = None,
+        bid_size: float = 0.0,
+        ask_price: Optional[float] = None,
+        ask_size: float = 0.0,
+    ) -> "TargetQuotes":
+        """Create TargetQuotes with single bid/ask (convenience constructor)."""
+        bids = {bid_price: bid_size} if bid_price and bid_size > 0 else {}
+        asks = {ask_price: ask_size} if ask_price and ask_size > 0 else {}
+        return cls(bids=bids, asks=asks)
 
 
 # =============================================================================
@@ -232,13 +285,11 @@ class SimpleMarketMaker(SimpleStrategy):
         # Don't quote if position too large
         bid_size = size if pos < self.max_position else 0
         ask_size = size if pos > -self.max_position else 0
-        
-        return TargetQuotes(
-            bid_price=bid if bid_size > 0 else None,
-            bid_size=bid_size,
-            ask_price=ask if ask_size > 0 else None,
-            ask_size=ask_size,
-        )
+
+        bids = {bid: bid_size} if bid_size > 0 else {}
+        asks = {ask: ask_size} if ask_size > 0 else {}
+
+        return TargetQuotes(bids=bids, asks=asks)
 
 
 class FixedQuoteStrategy(SimpleStrategy):
@@ -260,10 +311,8 @@ class FixedQuoteStrategy(SimpleStrategy):
     
     def compute_quotes(self, ctx: StrategyContext) -> TargetQuotes:
         return TargetQuotes(
-            bid_price=self.bid_price,
-            bid_size=self.size,
-            ask_price=self.ask_price,
-            ask_size=self.size,
+            bids={self.bid_price: self.size},
+            asks={self.ask_price: self.size},
         )
 
 
@@ -292,20 +341,15 @@ class EdgeBasedStrategy(SimpleStrategy):
         fair = ctx.fair_price
         
         # Only bid if we have edge
+        bids = {}
         bid_edge = fair - ctx.market_bid
-        bid_price = None
         if bid_edge > self.min_edge:
-            bid_price = fair - self.spread
-        
+            bids[fair - self.spread] = self.size
+
         # Only ask if we have edge
+        asks = {}
         ask_edge = ctx.market_ask - fair
-        ask_price = None
         if ask_edge > self.min_edge:
-            ask_price = fair + self.spread
-        
-        return TargetQuotes(
-            bid_price=bid_price,
-            bid_size=self.size if bid_price else 0,
-            ask_price=ask_price,
-            ask_size=self.size if ask_price else 0,
-        )
+            asks[fair + self.spread] = self.size
+
+        return TargetQuotes(bids=bids, asks=asks)

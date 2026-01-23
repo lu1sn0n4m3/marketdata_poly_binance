@@ -95,8 +95,14 @@ class MarketView:
     """Polymarket market view (internal to Container B)."""
     market_id: str  # Identifier for current hour market
     tick_size: float = 0.01  # Current tick size, dynamic
+    # Legacy combined fields (for backward compatibility)
     best_bid: Optional[float] = None  # Current BBO in [0,1]
     best_ask: Optional[float] = None
+    # Separate YES/NO orderbook views
+    yes_best_bid: Optional[float] = None
+    yes_best_ask: Optional[float] = None
+    no_best_bid: Optional[float] = None
+    no_best_ask: Optional[float] = None
     book_ts_local_ms: int = 0  # Local time last market update was received
     ws_age_ms: int = 0  # Age since last market WS message
 

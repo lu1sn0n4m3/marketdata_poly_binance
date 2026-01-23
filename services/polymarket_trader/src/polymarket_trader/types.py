@@ -58,7 +58,8 @@ class MarketBboEvent(Event):
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
     tick_size: float = 0.01
-    
+    token_id: str = ""  # Which token this update is for
+
     def __post_init__(self):
         self.event_type = EventType.MARKET_BBO
 
@@ -255,6 +256,10 @@ class CanonicalState:
                 tick_size=self.market_view.tick_size,
                 best_bid=self.market_view.best_bid,
                 best_ask=self.market_view.best_ask,
+                yes_best_bid=self.market_view.yes_best_bid,
+                yes_best_ask=self.market_view.yes_best_ask,
+                no_best_bid=self.market_view.no_best_bid,
+                no_best_ask=self.market_view.no_best_ask,
                 book_ts_local_ms=self.market_view.book_ts_local_ms,
                 ws_age_ms=self.market_view.ws_age_ms,
             ),

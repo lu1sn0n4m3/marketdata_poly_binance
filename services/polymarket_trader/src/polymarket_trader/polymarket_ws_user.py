@@ -204,17 +204,30 @@ class PolymarketUserWsClient:
         """Parse a single event."""
         events: list[Event] = []
         event_type = data.get("event_type", data.get("type", ""))
-        
+
+        # DEBUG: Print all incoming user WS messages
+        print(f"[USER_WS] event_type={event_type}, raw_data={data}")
+
         if event_type in ("order", "order_update"):
             # Order update
             order_data = data.get("order", data)
-            
+
+            # DEBUG: Print ALL order data fields with their values
+            print(f"[USER_WS ORDER] === RAW FIELDS ===")
+            for key, value in order_data.items():
+                print(f"[USER_WS ORDER]   {key}: {value}")
+            print(f"[USER_WS ORDER] === END FIELDS ===")
+
             # Parse filled/remaining
-            original_size = float(order_data.get("size", order_data.get("original_size", 0)))
-            remaining = float(order_data.get("size_matched", order_data.get("remaining", 0)))
-            # Note: Polymarket might use different field names
-            filled = original_size - remaining if original_size > 0 else 0
-            
+            # Polymarket uses: original_size = total, size_matched = amount filled
+            original_size = float(order_data.get("original_size", order_data.get("size", 0)))
+            size_matched = float(order_data.get("size_matched", 0))
+            # size_matched IS the filled amount, remaining is the difference
+            filled = size_matched
+            remaining = original_size - size_matched
+
+            print(f"[USER_WS ORDER] Parsed: original={original_size}, matched={size_matched}, remaining={remaining}")
+
             events.append(UserOrderEvent(
                 event_type=None,
                 ts_local_ms=recv_ts_ms,
@@ -227,20 +240,92 @@ class PolymarketUserWsClient:
                 remaining=remaining,
                 token_id=order_data.get("asset_id", order_data.get("token_id", "")),
             ))
+
+            # Parse trades from associate_trades array (fills come here!)
+            associate_trades = order_data.get("associate_trades", [])
+            if associate_trades:
+                print(f"[USER_WS ORDER] Found {len(associate_trades)} associate_trades!")
+                order_id = order_data.get("id", order_data.get("order_id", ""))
+                token_id = order_data.get("asset_id", order_data.get("token_id", ""))
+
+                # Determine actual side from maker_orders - most reliable method
+                # If maker was SELLING, we BOUGHT; if maker was BUYING, we SOLD
+                maker_orders = order_data.get("maker_orders", [])
+                raw_side = order_data.get("side", "BUY")
+
+                if maker_orders:
+                    maker_side = maker_orders[0].get("side", "").upper()
+                    if maker_side == "SELL":
+                        actual_side = Side.BUY  # Took from a sell = we bought
+                    elif maker_side == "BUY":
+                        actual_side = Side.SELL  # Sold to a buy = we sold
+                    else:
+                        actual_side = self._parse_side(raw_side)
+                    print(f"[USER_WS ORDER] maker_side={maker_side} -> our_side={actual_side.name}")
+                else:
+                    # No maker_orders, use the order's side directly (we placed this order)
+                    actual_side = self._parse_side(raw_side)
+                    print(f"[USER_WS ORDER] No maker_orders, using order side={actual_side.name}")
+
+                for trade in associate_trades:
+                    print(f"[USER_WS ASSOCIATE_TRADE] {trade}")
+                    trade_size = float(trade.get("size", trade.get("amount", 0)))
+                    trade_price = float(trade.get("price", 0))
+
+                    events.append(UserTradeEvent(
+                        event_type=None,
+                        ts_local_ms=recv_ts_ms,
+                        trade_id=trade.get("id", trade.get("trade_id", "")),
+                        order_id=order_id,
+                        side=actual_side,
+                        price=trade_price,
+                        size=trade_size,
+                        token_id=token_id,
+                    ))
         
         elif event_type in ("trade", "fill"):
             # Trade/fill
             trade_data = data.get("trade", data)
-            
+
+            # DEBUG: Print ALL trade data fields with their values
+            print(f"[USER_WS TRADE] === RAW FIELDS ===")
+            for key, value in trade_data.items():
+                print(f"[USER_WS TRADE]   {key}: {value}")
+            print(f"[USER_WS TRADE] === END FIELDS ===")
+
+            parsed_token = trade_data.get("asset_id", trade_data.get("token_id", ""))
+            raw_side = trade_data.get("side", "BUY")
+            parsed_size = trade_data.get("size", trade_data.get("amount", 0))
+            parsed_price = trade_data.get("price", 0)
+
+            # Determine actual side from maker_orders - most reliable method
+            # If maker was SELLING, we BOUGHT; if maker was BUYING, we SOLD
+            maker_orders = trade_data.get("maker_orders", [])
+            if maker_orders:
+                maker_side = maker_orders[0].get("side", "").upper()
+                if maker_side == "SELL":
+                    actual_side = Side.BUY  # Took from a sell = we bought
+                elif maker_side == "BUY":
+                    actual_side = Side.SELL  # Sold to a buy = we sold
+                else:
+                    actual_side = self._parse_side(raw_side)
+                print(f"[USER_WS TRADE] maker_side={maker_side} -> our_side={actual_side.name}")
+            else:
+                # No maker_orders, fall back to raw side
+                actual_side = self._parse_side(raw_side)
+                print(f"[USER_WS TRADE] No maker_orders, using raw side={actual_side.name}")
+
+            print(f"[USER_WS TRADE] PARSED: token={parsed_token[:30] if parsed_token else 'NONE'}... side={actual_side.name} size={parsed_size} price={parsed_price}")
+
             events.append(UserTradeEvent(
                 event_type=None,
                 ts_local_ms=recv_ts_ms,
                 trade_id=trade_data.get("id", trade_data.get("trade_id", "")),
                 order_id=trade_data.get("order_id", ""),
-                side=self._parse_side(trade_data.get("side", "BUY")),
+                side=actual_side,
                 price=float(trade_data.get("price", 0)),
                 size=float(trade_data.get("size", trade_data.get("amount", 0))),
-                token_id=trade_data.get("asset_id", trade_data.get("token_id", "")),
+                token_id=parsed_token,
             ))
         
         return events

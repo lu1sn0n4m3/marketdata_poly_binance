@@ -4,11 +4,17 @@ Production-Style End-to-End Test
 
 Tests the full HourMM framework with human-readable output.
 
-Uses a WorseSpreadStrategy that places orders 2 cents WORSE than market:
-  - YES buy order 2 cents below market bid
-  - NO buy order to simulate YES sell 2 cents above market ask
+Uses PositionAwareExecutor for smart order routing:
+  - BID (buy YES): Always places BUY on YES token
+  - ASK (sell YES):
+    - If you HAVE YES shares: places SELL on YES token (actual sell)
+    - If you DON'T have YES shares: places BUY on NO token at (1-price)
 
-This allows market making without splitting USDC into shares upfront.
+This allows market making without splitting USDC into shares upfront,
+while still properly selling shares when you have them.
+
+Uses a WorseSpreadStrategy that places orders 5 cents WORSE than market
+to avoid accidental fills during testing.
 
 REQUIRES CREDENTIALS in deploy/prod.env:
     PM_PRIVATE_KEY=0x...
@@ -124,7 +130,7 @@ from polymarket_trader.order_manager import OrderManager, DesiredOrders, Working
 from polymarket_trader.simple_strategy import (
     SimpleStrategy, StrategyContext, TargetQuotes
 )
-from polymarket_trader.simple_executor import SimpleExecutor, OpenOrder
+from polymarket_trader.simple_executor import SimpleExecutor, OpenOrder, PositionAwareExecutor
 from polymarket_trader.polymarket_rest import OrderRequest
 from hourmm_common.schemas import BinanceSnapshot
 from hourmm_common.enums import Side
@@ -182,22 +188,22 @@ class WalkingStrategy(SimpleStrategy):
         price = self.current_price
 
         self._last_targets = TargetQuotes(
-            bid_price=price,
-            bid_size=5.0,
-            ask_price=None,  # No ask
-            ask_size=0.0,
+            bids={price: 5.0},
+            asks={},  # No ask
         )
         return self._last_targets
 
 
 class WorseSpreadStrategy(SimpleStrategy):
     """
-    Strategy that places orders 2 cents WORSE than the current bid-ask spread.
+    Strategy that places UNATTRACTIVE bids on both YES and NO tokens.
 
-    - Posts YES buy (bid) 2 cents below market bid
-    - Posts NO buy to simulate YES sell (ask) at equivalent price 2 cents above market ask
+    Places bids at LOW prices that won't get filled.
 
-    This allows market making without needing to split USDC into shares upfront.
+    Works with PositionAwareExecutor:
+    - bid_price = unattractive YES bid (below market)
+    - ask_price = expressed as YES sell price, executor transforms to NO bid
+      (e.g., ask_price=0.72 → executor places NO bid at 1-0.72=0.28)
     """
 
     def __init__(self, worse_offset: float = 0.05, order_size: float = 5.0):
@@ -205,7 +211,7 @@ class WorseSpreadStrategy(SimpleStrategy):
         Initialize the worse spread strategy.
 
         Args:
-            worse_offset: How much worse than market to quote (default 0.02 = 2 cents)
+            worse_offset: How much worse than market to quote (default 0.05 = 5 cents)
             order_size: Size for each order (default 5.0)
         """
         self._worse_offset = worse_offset
@@ -214,33 +220,224 @@ class WorseSpreadStrategy(SimpleStrategy):
 
     def compute_quotes(self, ctx: StrategyContext) -> TargetQuotes:
         """
-        Compute quotes 2 cents worse than market bid/ask.
+        Place unattractive bids on both YES and NO tokens.
 
-        YES bid: market_bid - 0.02 (buying YES below market)
-        NO bid: 1 - (market_ask + 0.02) (buying NO, equivalent to selling YES above market)
+        Uses separate YES/NO market prices to place bids below each market's bid.
         """
-        # Need market prices to compute quotes
-        if ctx.market_bid is None or ctx.market_ask is None:
-            return TargetQuotes()  # No quotes if market prices unavailable
+        # Use separate YES/NO market bids if available
+        yes_bid = ctx.yes_market_bid
+        no_bid = ctx.no_market_bid
 
-        # YES buy order: 2 cents worse than market bid (lower)
-        yes_bid_price = ctx.market_bid - self._worse_offset
+        # Fallback to legacy prices if separate prices not available
+        if yes_bid is None and ctx.market_bid is not None:
+            # Guess: if market_bid < 0.5, it's probably the cheaper token
+            if ctx.market_bid < 0.5:
+                no_bid = ctx.market_bid
+                yes_bid = 1.0 - ctx.market_bid
+            else:
+                yes_bid = ctx.market_bid
+                no_bid = 1.0 - ctx.market_bid
 
-        # NO buy order: simulates YES sell 2 cents worse than market ask (higher)
-        # If market ask for YES is X, we want to simulate selling YES at X + 0.02
-        # Buying NO at price P is equivalent to selling YES at (1 - P)
-        # So we want: 1 - P = X + 0.02, which means P = 1 - (X + 0.02)
-        no_bid_price = 1.0 - (ctx.market_ask + self._worse_offset)
+        if yes_bid is None or no_bid is None:
+            return TargetQuotes()  # No prices available
 
-        # Clamp prices to valid range [0.01, 0.99]
-        yes_bid_price = max(0.01, min(0.99, yes_bid_price))
-        no_bid_price = max(0.01, min(0.99, no_bid_price))
+        # Place bids BELOW each market's bid (unattractive)
+        yes_bid_price = max(0.01, yes_bid - self._worse_offset)
+
+        # For NO side: calculate unattractive NO bid price
+        unattractive_no_bid = max(0.01, no_bid - self._worse_offset)
+
+        # PositionAwareExecutor interprets ask_price as a YES sell price
+        # and transforms it to NO bid via: no_bid = 1 - ask_price
+        # So express our desired NO bid as: ask_price = 1 - unattractive_no_bid
+        yes_ask_price = min(0.99, 1.0 - unattractive_no_bid)
 
         self._last_targets = TargetQuotes(
-            bid_price=yes_bid_price,
-            bid_size=self._order_size,
-            ask_price=no_bid_price,  # This is actually a NO buy, not a YES sell
-            ask_size=self._order_size,
+            bids={yes_bid_price: self._order_size},
+            asks={yes_ask_price: self._order_size},  # Executor transforms: 1 - 0.72 = 0.28 (unattractive NO bid)
+        )
+        return self._last_targets
+
+
+class PositionSkewStrategy(SimpleStrategy):
+    """
+    Position-aware market making strategy with inventory skewing.
+
+    Asymmetric quoting based on current position:
+    1. Flat: symmetric 3c from BBO on both sides
+    2. Long YES: sell YES 2c from ask (closer), bid YES 4c from bid (further)
+    3. Long NO: sell NO 2c from ask (closer), bid YES 4c from bid (further)
+
+    Safety mechanism: if any BBO <= 0.04, DON'T TRADE normally but place
+    sell orders on entire inventory AT the BBO to exit position.
+
+    Works with PositionAwareExecutor which handles the actual order routing:
+    - When we have YES and output an ask, executor places SELL YES
+    - When we have NO and output an ask, executor places SELL NO
+    - When we have neither and output an ask, executor places BUY NO
+    """
+
+    FLAT_OFFSET = 0.01      # 3c symmetric when flat
+    CLOSE_OFFSET = 0.00     # 2c closer for reducing position (AWAY from BBO)
+    FAR_OFFSET = 0.03       # 4c further for increasing position
+    DANGER_THRESHOLD = 0.04  # Safety trigger if BBO <= this
+
+    def __init__(self, order_size: float = 5.0):
+        """
+        Initialize the position skew strategy.
+
+        Args:
+            order_size: Size for each order (default 5.0)
+        """
+        self._order_size = order_size
+        self._last_targets: TargetQuotes = None
+
+    def compute_quotes(self, ctx: StrategyContext) -> TargetQuotes:
+        """
+        Compute target quotes with position-aware skewing.
+        """
+        # Get YES token BBO
+        yes_bid = ctx.yes_market_bid
+        yes_ask = ctx.yes_market_ask
+
+        # Get NO token BBO
+        no_bid = ctx.no_market_bid
+        no_ask = ctx.no_market_ask
+
+        # Fallback to legacy prices if separate prices not available
+        if yes_bid is None and ctx.market_bid is not None:
+            if ctx.market_bid < 0.5:
+                no_bid = ctx.market_bid
+                yes_bid = 1.0 - ctx.market_bid
+            else:
+                yes_bid = ctx.market_bid
+                no_bid = 1.0 - ctx.market_bid
+
+        if yes_ask is None and ctx.market_ask is not None:
+            if ctx.market_ask < 0.5:
+                no_ask = ctx.market_ask
+                yes_ask = 1.0 - ctx.market_ask
+            else:
+                yes_ask = ctx.market_ask
+                no_ask = 1.0 - ctx.market_ask
+
+        # Need prices to quote
+        if yes_bid is None or yes_ask is None:
+            return TargetQuotes()
+
+        # Safety check: if any BBO is dangerously low, exit position
+        all_bbo_values = [v for v in [yes_bid, yes_ask, no_bid, no_ask] if v is not None]
+        if any(v <= self.DANGER_THRESHOLD for v in all_bbo_values):
+            return self._safety_exit(ctx, yes_bid, yes_ask, no_bid, no_ask)
+
+        # Get position
+        yes_pos = ctx.yes_position
+        no_pos = ctx.no_position
+
+        # Determine position state
+        if yes_pos > 0:
+            # Long YES: want to reduce -> sell YES closer, bid further
+            return self._long_yes_quotes(yes_bid, yes_ask, yes_pos)
+        elif no_pos > 0:
+            # Long NO: want to reduce -> sell NO closer, bid YES further
+            return self._long_no_quotes(yes_bid, no_bid, no_ask, no_pos)
+        else:
+            # Flat: symmetric quotes
+            return self._flat_quotes(yes_bid, yes_ask)
+
+    def _flat_quotes(self, yes_bid: float, yes_ask: float) -> TargetQuotes:
+        """
+        Flat position: quote both sides symmetrically.
+
+        Places bid for YES and ask (which executor converts to BUY NO).
+        Position tracking will detect fills and switch to appropriate mode.
+        """
+        bid_price = max(0.01, yes_bid - self.FLAT_OFFSET)
+        ask_price = min(0.99, yes_ask + self.FLAT_OFFSET)
+
+        self._last_targets = TargetQuotes(
+            bids={bid_price: self._order_size},
+            asks={ask_price: self._order_size},
+        )
+        return self._last_targets
+
+    def _long_yes_quotes(
+        self, yes_bid: float, yes_ask: float, yes_pos: float
+    ) -> TargetQuotes:
+        """
+        Long YES: aggressive on selling, passive on buying.
+        - Sell YES at ask - 2c (closer, more likely to fill)
+        - Bid YES at bid - 4c (further, less likely to fill)
+        """
+        # Sell closer to market (more aggressive)
+        ask_price = max(0.01, yes_ask - self.CLOSE_OFFSET)
+        # Bid further from market (less aggressive)
+        bid_price = max(0.01, yes_bid - self.FAR_OFFSET)
+
+        self._last_targets = TargetQuotes(
+            bids={bid_price: self._order_size},
+            asks={ask_price: min(self._order_size, yes_pos)},  # Don't sell more than we have
+        )
+        return self._last_targets
+
+    def _long_no_quotes(
+        self, yes_bid: float, no_bid: float, no_ask: float, no_pos: float
+    ) -> TargetQuotes:
+        """
+        Long NO: aggressive on selling NO, passive on buying YES.
+        - Sell NO at no_ask - 2c (expressed as YES ask for executor)
+        - Bid YES at yes_bid - 4c (further, less likely to fill)
+
+        The executor handles routing: when we have NO position and output an ask,
+        it will place SELL NO instead of BUY NO.
+        """
+        # Sell NO closer to market (more aggressive)
+        # Express as YES ask price: if we want to sell NO at X, YES equivalent is (1-X)
+        if no_ask is not None:
+            no_sell_price = max(0.01, no_ask - self.CLOSE_OFFSET)
+            yes_ask_equivalent = min(0.99, 1.0 - no_sell_price)
+        else:
+            # Fallback: use complement of yes_bid
+            yes_ask_equivalent = min(0.99, yes_bid + self.CLOSE_OFFSET)
+
+        # Bid YES further from market (less aggressive)
+        bid_price = max(0.01, yes_bid - self.FAR_OFFSET)
+
+        self._last_targets = TargetQuotes(
+            bids={bid_price: self._order_size},
+            asks={yes_ask_equivalent: min(self._order_size, no_pos)},  # Don't sell more than we have
+        )
+        return self._last_targets
+
+    def _safety_exit(
+        self,
+        ctx: StrategyContext,
+        yes_bid: Optional[float],
+        yes_ask: Optional[float],
+        no_bid: Optional[float],
+        no_ask: Optional[float],
+    ) -> TargetQuotes:
+        """
+        Safety mode: BBO is dangerously low. Exit all positions AT the BBO.
+        Don't place any new bids, only sell inventory.
+        """
+        yes_pos = ctx.yes_position
+        no_pos = ctx.no_position
+
+        asks = {}
+
+        if yes_pos > 0 and yes_bid is not None:
+            # Sell all YES at the current bid (immediate exit)
+            asks[yes_bid] = yes_pos
+
+        if no_pos > 0 and no_bid is not None:
+            # Sell all NO - express as YES ask (executor will route to SELL NO)
+            yes_ask_equivalent = min(0.99, 1.0 - no_bid)
+            asks[yes_ask_equivalent] = no_pos
+
+        self._last_targets = TargetQuotes(
+            bids={},  # No new bids in safety mode
+            asks=asks,
         )
         return self._last_targets
 
@@ -253,25 +450,33 @@ def build_strategy_context(
 ) -> StrategyContext:
     """Bridge function: Convert state view to StrategyContext."""
     from polymarket_trader.simple_strategy import StrategyContext
-    
-    # Extract position
+
+    # Extract position (both net and separate YES/NO)
     position = state_view.positions.net_exposure if state_view.positions else 0.0
-    
-    # Extract market prices
+    yes_position = state_view.positions.yes_tokens if state_view.positions else 0.0
+    no_position = state_view.positions.no_tokens if state_view.positions else 0.0
+
+    # Extract market prices (legacy combined fields)
     market_bid = state_view.market_view.best_bid
     market_ask = state_view.market_view.best_ask
     tick_size = state_view.market_view.tick_size or 0.01
-    
+
+    # Extract separate YES/NO market prices
+    yes_market_bid = state_view.market_view.yes_best_bid
+    yes_market_ask = state_view.market_view.yes_best_ask
+    no_market_bid = state_view.market_view.no_best_bid
+    no_market_ask = state_view.market_view.no_best_ask
+
     # Extract fair price
     fair_price = snapshot.p_yes_fair if snapshot else None
     btc_price = snapshot.last_trade_price if snapshot else None
-    
+
     # Extract current open orders
     open_bid_price = None
     open_bid_size = 0.0
     open_ask_price = None
     open_ask_size = 0.0
-    
+
     for order in state_view.open_orders.values():
         if order.side == Side.BUY:
             open_bid_price = order.price
@@ -279,11 +484,11 @@ def build_strategy_context(
         else:
             open_ask_price = order.price
             open_ask_size = order.size
-    
+
     # Extract token IDs
     yes_token_id = state_view.token_ids.yes_token_id if state_view.token_ids else ""
     no_token_id = state_view.token_ids.no_token_id if state_view.token_ids else ""
-    
+
     return StrategyContext(
         now_ms=now_ms,
         t_remaining_ms=t_remaining_ms,
@@ -291,6 +496,10 @@ def build_strategy_context(
         market_bid=market_bid,
         market_ask=market_ask,
         tick_size=tick_size,
+        yes_market_bid=yes_market_bid,
+        yes_market_ask=yes_market_ask,
+        no_market_bid=no_market_bid,
+        no_market_ask=no_market_ask,
         fair_price=fair_price,
         btc_price=btc_price,
         open_bid_price=open_bid_price,
@@ -299,6 +508,8 @@ def build_strategy_context(
         open_ask_size=open_ask_size,
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
+        yes_position=yes_position,
+        no_position=no_position,
     )
 
 
@@ -311,61 +522,15 @@ def build_open_orders_dict(state_view: CanonicalStateView) -> dict[str, OpenOrde
             side=order.side,
             price=order.price,
             size=order.size,
+            token_id=order.token_id,  # Include token_id for position-aware routing
         )
     return result
 
 
-class DualTokenExecutor(SimpleExecutor):
-    """
-    Extended executor that can place orders on both YES and NO tokens.
-
-    - bid_price (from TargetQuotes) -> BUY order on YES token
-    - ask_price (from TargetQuotes) -> BUY order on NO token (simulating YES sell)
-
-    This allows market making without splitting USDC upfront.
-    """
-
-    async def _place(self, side: Side, price: float, size: float, now_ms: int) -> None:
-        """
-        Fire a place request.
-
-        Overrides parent to use:
-        - YES token for BUY side (bid)
-        - NO token for SELL side (which we interpret as NO buy)
-        """
-        self.places_sent += 1
-
-        try:
-            expires_at_ms = now_ms + self.default_ttl_ms
-
-            # Determine which token to use based on side
-            # BUY = YES token buy (normal bid)
-            # SELL = NO token buy (simulating YES sell)
-            if side == Side.BUY:
-                token_id = self.yes_token_id
-                actual_side = Side.BUY
-            else:  # Side.SELL
-                token_id = self.no_token_id
-                actual_side = Side.BUY  # We're buying NO, not selling YES
-
-            request = OrderRequest(
-                client_req_id=f"{now_ms}_{side.name}",
-                token_id=token_id,
-                side=actual_side,  # Always BUY in this strategy
-                price=price,
-                size=size,
-                expires_at_ms=expires_at_ms,
-            )
-
-            result = await self.rest.place_order(request)
-
-            if not result.success:
-                self.place_failures += 1
-                logger.warning(f"Place failed: {result.error_msg} [{side.name} {size:.0f} @ ${price:.2f}]")
-
-        except Exception as e:
-            self.place_failures += 1
-            logger.warning(f"Place request failed: {e}")
+# DualTokenExecutor removed - replaced by PositionAwareExecutor from simple_executor.py
+# PositionAwareExecutor provides position-aware routing:
+# - If you HAVE YES shares and want to sell -> actually SELL YES
+# - If you DON'T have YES shares and want to sell -> BUY NO at complement price
 
 
 # =============================================================================
@@ -401,9 +566,8 @@ class TestContainerBApp(ContainerBApp):
     def _setup_components(self) -> None:
         super()._setup_components()
         # Create and store the strategy
-        # Switch to WorseSpreadStrategy for the 2 cents worse strategy
-        self._strategy_instance = WorseSpreadStrategy(
-            worse_offset=0.05,  # 2 cents worse
+        # Use PositionSkewStrategy for inventory-aware asymmetric quoting
+        self._strategy_instance = PositionSkewStrategy(
             order_size=5.0,     # 5 unit orders
         )
 
@@ -420,6 +584,7 @@ class TestContainerBApp(ContainerBApp):
             rest_client=self.rest,
             display_callback=self._display_callback,
             strategy_ref=self._strategy_instance,
+            reducer=self.reducer,  # Pass reducer to drain queue before reading state
         )
     
     async def start(self):
@@ -430,10 +595,10 @@ class TestContainerBApp(ContainerBApp):
         # Wait a bit for market to be selected and state to stabilize
         await asyncio.sleep(1)
         
-        # Now create dual token executor with token IDs
+        # Now create position-aware executor with token IDs
         state_view = self.state.view()
         if state_view.token_ids:
-            self._simple_executor = DualTokenExecutor(
+            self._simple_executor = PositionAwareExecutor(
                 rest=self.rest,
                 yes_token_id=state_view.token_ids.yes_token_id,
                 no_token_id=state_view.token_ids.no_token_id or "",
@@ -444,7 +609,7 @@ class TestContainerBApp(ContainerBApp):
 
 class DisplayDecisionLoop:
     """Decision loop with human-readable display each tick - SIMPLIFIED VERSION."""
-    
+
     def __init__(
         self,
         tick_hz: int,
@@ -454,6 +619,7 @@ class DisplayDecisionLoop:
         rest_client,
         display_callback=None,
         strategy_ref=None,
+        reducer=None,
     ):
         self._state_provider = state_provider
         self._snapshot_provider = snapshot_provider
@@ -462,10 +628,11 @@ class DisplayDecisionLoop:
         self._simple_executor: Optional[SimpleExecutor] = None
         self._display_callback = display_callback
         self._strategy_ref = strategy_ref
+        self._reducer = reducer  # Reducer to drain pending events before reading state
         self._tick_hz = tick_hz
         self._tick_count = 0
         self._running = False
-        
+
         # Track previous tick's orders for diff
         self._prev_orders: dict = {}
     
@@ -494,7 +661,11 @@ class DisplayDecisionLoop:
             self._tick_count += 1
             
             try:
-                # Get FRESH state
+                # Drain any pending events from reducer queue to ensure fresh state
+                if self._reducer:
+                    await self._reducer.drain_pending()
+
+                # Get FRESH state (now guaranteed to include all processed events)
                 state_view = self._state_provider()
                 snapshot = self._snapshot_provider()
                 
@@ -516,8 +687,16 @@ class DisplayDecisionLoop:
                 # Sync to targets (fire and forget)
                 actions_summary = {}
                 rest_latency_ms = 0
-                
+
                 if self._simple_executor:
+                    # Update executor's position view before syncing
+                    # This enables position-aware routing (sell shares vs buy opposite)
+                    if hasattr(self._simple_executor, 'update_position'):
+                        self._simple_executor.update_position(
+                            yes_position=strategy_ctx.yes_position,
+                            no_position=strategy_ctx.no_position,
+                        )
+
                     t0 = time_ns()
                     actions_summary = await self._simple_executor.sync_to_targets(
                         targets, current_orders, now_ms
@@ -644,22 +823,37 @@ def display_tick(
     # BTC price (compact)
     if snapshot:
         lines.append(f" BTC:  ${snapshot.last_trade_price or 0:,.2f}")
-    
+
+    # Position
+    if state_after and state_after.positions:
+        pos = state_after.positions
+        yes_pos = pos.yes_tokens
+        no_pos = pos.no_tokens
+        net = pos.net_exposure
+        pos_str = f" POS:  YES={yes_pos:+.1f}  NO={no_pos:+.1f}  (net={net:+.1f})"
+        lines.append(pos_str)
+
     # Actions taken THIS tick
     lines.append("")
     if actions_summary:
         places = actions_summary.get("places", [])
         cancels = actions_summary.get("cancels", [])
         kept = actions_summary.get("kept", [])
-        
+        pending = actions_summary.get("pending", [])
+
         if places or cancels:
             lines.append(f" ACTIONS: {len(places)} place, {len(cancels)} cancel  (took {rest_latency_ms}ms)")
             for action in places:
                 lines.append(f"  → PLACE: {action}")
             for action in cancels:
                 lines.append(f"  → CANCEL: {action}")
-        elif kept:
-            lines.append(f" ACTIONS: (kept {len(kept)} orders)")
+        elif kept or pending:
+            parts = []
+            if kept:
+                parts.append(f"kept {len(kept)}")
+            if pending:
+                parts.append(f"pending {len(pending)}")
+            lines.append(f" ACTIONS: ({', '.join(parts)})")
         else:
             lines.append(" ACTIONS: (none)")
     else:
@@ -704,7 +898,7 @@ class ProductionE2ETest:
     def create_container_a_config(self) -> AConfig:
         return AConfig(
             symbol="BTCUSDT",
-            snapshot_publish_hz=2,
+            snapshot_publish_hz=1,
             http_host="127.0.0.1",
             http_port=8080,
             stale_threshold_ms=5000,
@@ -724,7 +918,7 @@ class ProductionE2ETest:
             )
         
         return BConfig(
-            poll_snapshot_hz=5,  # 5 Hz = 200ms per tick
+            poll_snapshot_hz=20,  # 5 Hz = 200ms per tick
             snapshot_url="http://127.0.0.1:8080/snapshot/latest",
             market_slug=market_slug,
             pm_private_key=pm_private_key,
@@ -734,7 +928,7 @@ class ProductionE2ETest:
             max_position_size=50.0,
             max_order_size=10.0,
             max_open_orders=4,
-            default_order_ttl_ms=64_000,
+            default_order_ttl_ms=90_000,  # 90 second TTL (Polymarket requires min 1 minute)
             replace_min_age_ms=0,  # Allow immediate replace
             replace_min_ticks=1,   # Replace if price moves 1 tick
             sqlite_path="/tmp/hourmm_test_journal.db",
@@ -764,13 +958,15 @@ class ProductionE2ETest:
         try:
             # Print header
             print("\n" + "=" * 60)
-            print(" HOURMM E2E TEST - Worse Spread Strategy Demo")
+            print(" HOURMM E2E TEST - Position Skew Strategy")
             print("=" * 60)
             print()
-            print(" Strategy: Places orders 2 cents WORSE than market")
-            print("   - YES buy:  market_bid - $0.02")
-            print("   - NO buy:   simulating YES sell at market_ask + $0.02")
-            print(" Frequency: 5 Hz (200ms per tick)")
+            print(" Strategy: Asymmetric quoting based on inventory")
+            print("   - Flat:     symmetric 3c from BBO")
+            print("   - Long YES: sell 2c from ask (closer), bid 4c from bid (further)")
+            print("   - Long NO:  sell NO 2c from ask, bid YES 4c from bid")
+            print("   - Safety:   if BBO <= 4c, sell inventory at BBO")
+            print(" Frequency: 20 Hz (50ms per tick)")
             print()
             print(" Press Ctrl+C to stop")
             print()

@@ -139,20 +139,44 @@ class GammaClient:
                 for market in markets:
                     if not market.get("active", True):
                         continue
-                    
+
                     # Parse token IDs
                     token_ids_raw = market.get("clobTokenIds", [])
                     if isinstance(token_ids_raw, str):
                         token_ids_raw = orjson.loads(token_ids_raw)
-                    
+
                     if len(token_ids_raw) < 2:
                         continue
-                    
+
+                    # Parse outcomes to correctly map token IDs
+                    # The outcomes array corresponds to clobTokenIds array
+                    # For "Bitcoin Up or Down": "Up" = YES, "Down" = NO
+                    outcomes = market.get("outcomes", [])
+                    if isinstance(outcomes, str):
+                        outcomes = orjson.loads(outcomes)
+
+                    # Default: [0]=YES, [1]=NO (but this is often wrong!)
+                    yes_idx, no_idx = 0, 1
+
+                    # Find correct indices based on outcome names
+                    if len(outcomes) >= 2:
+                        for i, outcome in enumerate(outcomes):
+                            outcome_lower = str(outcome).lower()
+                            if outcome_lower in ("up", "yes", "true"):
+                                yes_idx = i
+                            elif outcome_lower in ("down", "no", "false"):
+                                no_idx = i
+
+                    # Log what we found for debugging
+                    print(f"[GAMMA] Outcomes: {outcomes}")
+                    print(f"[GAMMA] YES idx={yes_idx} (token={token_ids_raw[yes_idx][:20]}...)")
+                    print(f"[GAMMA] NO idx={no_idx} (token={token_ids_raw[no_idx][:20]}...)")
+
                     tokens = TokenIds(
-                        yes_token_id=token_ids_raw[0],
-                        no_token_id=token_ids_raw[1],
+                        yes_token_id=token_ids_raw[yes_idx],
+                        no_token_id=token_ids_raw[no_idx],
                     )
-                    
+
                     return MarketInfo(
                         condition_id=market.get("conditionId", ""),
                         market_slug=hourly_slug,

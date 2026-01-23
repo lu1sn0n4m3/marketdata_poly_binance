@@ -20,7 +20,7 @@ from .journal_sqlite import EventJournalSQLite
 from .reducer import StateReducer
 from .reconciler import Reconciler
 from .risk import RiskEngine
-from .strategy import OpportunisticQuoteStrategy
+from .strategy import Strategy, OpportunisticQuoteStrategy
 from .order_manager import OrderManager
 from .executor import Executor
 from .snapshot_poller import SnapshotPoller
@@ -44,14 +44,16 @@ class ContainerBApp:
     DecisionLoop (50Hz) -> RiskEngine -> Strategy -> OrderManager -> Executor
     """
     
-    def __init__(self, config: BConfig):
+    def __init__(self, config: BConfig, strategy: Optional[Strategy] = None):
         """
         Initialize the application.
-        
+
         Args:
             config: Application configuration
+            strategy: Optional custom strategy (defaults to OpportunisticQuoteStrategy)
         """
         self.config = config
+        self._custom_strategy = strategy
         config.validate()
         
         # Canonical state
@@ -67,7 +69,7 @@ class ContainerBApp:
         self.reducer: Optional[StateReducer] = None
         self.reconciler: Optional[Reconciler] = None
         self.risk: Optional[RiskEngine] = None
-        self.strategy: Optional[OpportunisticQuoteStrategy] = None
+        self.strategy: Optional[Strategy] = None
         self.order_manager: Optional[OrderManager] = None
         self.executor: Optional[Executor] = None
         self.poller: Optional[SnapshotPoller] = None
@@ -155,8 +157,8 @@ class ContainerBApp:
             stale_threshold_ms=self.config.stale_snapshot_threshold_ms,
         )
         
-        # Strategy
-        self.strategy = OpportunisticQuoteStrategy()
+        # Strategy (use injected or default)
+        self.strategy = self._custom_strategy or OpportunisticQuoteStrategy()
         
         # Order manager
         self.order_manager = OrderManager(

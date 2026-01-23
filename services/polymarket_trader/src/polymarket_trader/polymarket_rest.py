@@ -49,12 +49,36 @@ class CancelAck:
 
 
 @dataclass
+class BatchOrderAck:
+    """Acknowledgment from batch order placement."""
+    successful: list[str]  # List of order IDs that succeeded
+    failed: list[tuple[str, str]]  # List of (client_req_id, error_msg) for failures
+    success: bool  # True if all orders succeeded
+
+
+@dataclass
+class BatchCancelAck:
+    """Acknowledgment from batch cancellation."""
+    cancelled: list[str]  # Order IDs that were cancelled
+    not_cancelled: dict[str, str]  # {order_id: reason} for failures
+    success: bool  # True if all cancels succeeded
+
+
+@dataclass
 class CancelAllAck:
     """Acknowledgment from cancel-all."""
     market_id: str
     cancelled_count: int
     success: bool
     error_msg: str = ""
+
+
+@dataclass
+class TokenPosition:
+    """Position in a specific token."""
+    token_id: str
+    size: float  # Number of tokens held
+    avg_price: float = 0.0  # Average entry price (if available)
 
 
 class PolymarketRestClient:
@@ -256,12 +280,12 @@ class PolymarketRestClient:
     async def place_order(self, order: OrderRequest) -> OrderAck:
         """
         Place an order asynchronously.
-        
+
         The order is signed using the private key before submission.
-        
+
         Args:
             order: OrderRequest to place
-        
+
         Returns:
             OrderAck with result
         """
@@ -271,11 +295,189 @@ class PolymarketRestClient:
         if elapsed < self._min_request_interval_ms:
             await asyncio.sleep((self._min_request_interval_ms - elapsed) / 1000)
         self._last_request_ms = time_ns() // 1_000_000
-        
+
         # Execute in thread pool
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, self._place_order_sync, order)
-    
+
+    def _place_orders_sync(self, orders: list[OrderRequest]) -> BatchOrderAck:
+        """Place multiple orders in a single batch (called from thread pool)."""
+        if not self._init_client():
+            return BatchOrderAck(
+                successful=[],
+                failed=[(o.client_req_id, "Client not initialized") for o in orders],
+                success=False,
+            )
+
+        if not orders:
+            return BatchOrderAck(successful=[], failed=[], success=True)
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # Build PostOrdersArgs list for batch API
+            post_orders_args = []
+            for order in orders:
+                is_buy = (order.side.name == "BUY" if hasattr(order.side, 'name')
+                         else str(order.side) == "Side.BUY")
+                order_side = BUY if is_buy else SELL
+                expiration_seconds = int(order.expires_at_ms / 1000)
+
+                order_args = OrderArgs(
+                    token_id=order.token_id,
+                    price=float(order.price),
+                    size=float(order.size),
+                    side=order_side,
+                    expiration=expiration_seconds,
+                )
+                signed_order = self._client.create_order(order_args)
+                post_orders_args.append(PostOrdersArgs(
+                    order=signed_order,
+                    orderType=OrderType.GTD,
+                    postOnly=False,
+                ))
+
+            # Post all orders in a batch
+            response = self._client.post_orders(post_orders_args)
+
+            # Parse response
+            successful = []
+            failed = []
+
+            if response:
+                # Response format depends on py-clob-client version
+                if isinstance(response, list):
+                    for i, resp in enumerate(response):
+                        if isinstance(resp, dict):
+                            if resp.get("success", True) and not resp.get("errorMsg"):
+                                order_id = resp.get("orderID", resp.get("id", ""))
+                                successful.append(order_id)
+                            else:
+                                client_id = orders[i].client_req_id if i < len(orders) else ""
+                                failed.append((client_id, resp.get("errorMsg", "Unknown error")))
+                        else:
+                            successful.append(str(resp))
+                elif isinstance(response, dict):
+                    # Single response for batch
+                    if response.get("success", True):
+                        order_ids = response.get("orderIDs", [])
+                        successful.extend(order_ids)
+                    else:
+                        for order in orders:
+                            failed.append((order.client_req_id, response.get("errorMsg", "Batch failed")))
+
+            self._consecutive_errors = 0 if not failed else self._consecutive_errors + 1
+            return BatchOrderAck(
+                successful=successful,
+                failed=failed,
+                success=len(failed) == 0,
+            )
+
+        except Exception as e:
+            self._consecutive_errors += 1
+            self._last_error_ms = time_ns() // 1_000_000
+            logger.error(f"Batch order placement error: {e}")
+            return BatchOrderAck(
+                successful=[],
+                failed=[(o.client_req_id, str(e)) for o in orders],
+                success=False,
+            )
+
+    async def place_orders(self, orders: list[OrderRequest]) -> BatchOrderAck:
+        """
+        Place multiple orders in a single batch request.
+
+        This is more efficient than calling place_order() multiple times.
+
+        Args:
+            orders: List of OrderRequests to place
+
+        Returns:
+            BatchOrderAck with results
+        """
+        if not orders:
+            return BatchOrderAck(successful=[], failed=[], success=True)
+
+        # Rate limiting
+        now_ms = time_ns() // 1_000_000
+        elapsed = now_ms - self._last_request_ms
+        if elapsed < self._min_request_interval_ms:
+            await asyncio.sleep((self._min_request_interval_ms - elapsed) / 1000)
+        self._last_request_ms = time_ns() // 1_000_000
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, self._place_orders_sync, orders)
+
+    def _cancel_orders_sync(self, order_ids: list[str]) -> BatchCancelAck:
+        """Cancel multiple orders in a single batch (called from thread pool)."""
+        if not self._init_client():
+            return BatchCancelAck(
+                cancelled=[],
+                not_cancelled={oid: "Client not initialized" for oid in order_ids},
+                success=False,
+            )
+
+        if not order_ids:
+            return BatchCancelAck(cancelled=[], not_cancelled={}, success=True)
+
+        try:
+            # Use batch cancel - py-clob-client's cancel_orders() for multiple order IDs
+            response = self._client.cancel_orders(order_ids)
+
+            # Parse response
+            cancelled = []
+            not_cancelled = {}
+
+            if response:
+                if isinstance(response, dict):
+                    cancelled = response.get("canceled", [])
+                    not_cancelled = response.get("not_canceled", {})
+                elif isinstance(response, list):
+                    cancelled = response
+
+            self._consecutive_errors = 0 if not not_cancelled else self._consecutive_errors + 1
+            return BatchCancelAck(
+                cancelled=cancelled,
+                not_cancelled=not_cancelled,
+                success=len(not_cancelled) == 0,
+            )
+
+        except Exception as e:
+            self._consecutive_errors += 1
+            self._last_error_ms = time_ns() // 1_000_000
+            logger.error(f"Batch cancel error: {e}")
+            return BatchCancelAck(
+                cancelled=[],
+                not_cancelled={oid: str(e) for oid in order_ids},
+                success=False,
+            )
+
+    async def cancel_orders(self, order_ids: list[str]) -> BatchCancelAck:
+        """
+        Cancel multiple orders in a single batch request.
+
+        This is more efficient than calling cancel_order() multiple times.
+
+        Args:
+            order_ids: List of order IDs to cancel
+
+        Returns:
+            BatchCancelAck with results
+        """
+        if not order_ids:
+            return BatchCancelAck(cancelled=[], not_cancelled={}, success=True)
+
+        # Rate limiting
+        now_ms = time_ns() // 1_000_000
+        elapsed = now_ms - self._last_request_ms
+        if elapsed < self._min_request_interval_ms:
+            await asyncio.sleep((self._min_request_interval_ms - elapsed) / 1000)
+        self._last_request_ms = time_ns() // 1_000_000
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, self._cancel_orders_sync, order_ids)
+
     def _cancel_order_sync(self, order_id: str) -> CancelAck:
         """Cancel an order synchronously (called from thread pool)."""
         if not self._init_client():

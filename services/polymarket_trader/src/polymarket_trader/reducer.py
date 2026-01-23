@@ -20,12 +20,12 @@ logger = logging.getLogger(__name__)
 class StateReducer:
     """
     Single-writer canonical state reducer.
-    
+
     INVARIANT: This is the ONLY component allowed to mutate CanonicalState.
-    
+
     All events flow through the reducer queue and are processed sequentially.
     """
-    
+
     def __init__(
         self,
         state: CanonicalState,
@@ -35,7 +35,7 @@ class StateReducer:
     ):
         """
         Initialize the reducer.
-        
+
         Args:
             state: CanonicalState to manage
             journal: EventJournalSQLite for persistence
@@ -46,13 +46,19 @@ class StateReducer:
         self.journal = journal
         self.scheduler = scheduler
         self._on_reconnect = on_reconnect
-        
+
         # Event queue - all events flow through here
         self.queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=10000)
-        
+
         self._running = False
         self._snapshot_interval_events = 100  # Snapshot every N events
         self._event_count = 0
+
+        # Track order IDs from orders WE placed
+        self._our_order_ids: set[str] = set()
+
+        # Track seen trade IDs to deduplicate replayed historical trades
+        self._seen_trade_ids: set[str] = set()
     
     async def run(self, shutdown_event: Optional[asyncio.Event] = None) -> None:
         """
@@ -136,10 +142,29 @@ class StateReducer:
     
     def _reduce_market_bbo(self, event: MarketBboEvent) -> None:
         """Handle market BBO event."""
+        # Route to correct YES/NO fields based on token_id
+        token_ids = self.state.token_ids
+        is_yes_token = token_ids and event.token_id == token_ids.yes_token_id
+        is_no_token = token_ids and event.token_id == token_ids.no_token_id
+
+        if is_yes_token:
+            if event.best_bid is not None:
+                self.state.market_view.yes_best_bid = event.best_bid
+            if event.best_ask is not None:
+                self.state.market_view.yes_best_ask = event.best_ask
+        elif is_no_token:
+            if event.best_bid is not None:
+                self.state.market_view.no_best_bid = event.best_bid
+            if event.best_ask is not None:
+                self.state.market_view.no_best_ask = event.best_ask
+
+        # Also update legacy combined fields (for backward compatibility)
+        # Use YES token prices if available, otherwise use whatever we got
         if event.best_bid is not None:
             self.state.market_view.best_bid = event.best_bid
         if event.best_ask is not None:
             self.state.market_view.best_ask = event.best_ask
+
         self.state.market_view.tick_size = event.tick_size
         self.state.market_view.book_ts_local_ms = event.ts_local_ms
         self.state.health.market_ws_last_msg_ms = event.ts_local_ms
@@ -190,28 +215,56 @@ class StateReducer:
     
     def _reduce_user_trade(self, event: UserTradeEvent) -> None:
         """Handle user trade event."""
-        # Update positions
+        # Deduplicate: skip trades we've already processed
+        if event.trade_id and event.trade_id in self._seen_trade_ids:
+            print(f"[TRADE] SKIP duplicate trade_id: {event.trade_id[:20]}...")
+            return
+
+        # Mark as seen
+        if event.trade_id:
+            self._seen_trade_ids.add(event.trade_id)
+
         token_id = event.token_id
         size = event.size
-        
-        # Determine if YES or NO token (simplified - would need actual token mapping)
-        # For now, assume we track based on side
-        if event.side == Side.BUY:
-            self.state.positions.yes_tokens += size
+        token_ids = self.state.token_ids
+
+        # Identify which token was traded
+        is_yes_token = token_ids and token_id == token_ids.yes_token_id
+        is_no_token = token_ids and token_id == token_ids.no_token_id
+
+        token_name = "YES" if is_yes_token else ("NO" if is_no_token else "UNKNOWN")
+        print(f"[TRADE] {event.side.name} {size} {token_name} @ {event.price}")
+
+        if is_yes_token:
+            # YES token: BUY increases yes_tokens, SELL decreases
+            if event.side == Side.BUY:
+                self.state.positions.yes_tokens += size
+            else:
+                self.state.positions.yes_tokens -= size
+        elif is_no_token:
+            # NO token: BUY increases no_tokens, SELL decreases
+            if event.side == Side.BUY:
+                self.state.positions.no_tokens += size
+            else:
+                self.state.positions.no_tokens -= size
         else:
-            self.state.positions.yes_tokens -= size
-        
-        logger.info(
-            f"Trade: {event.side.name} {size} @ {event.price} "
-            f"(pos: {self.state.positions.yes_tokens})"
+            print(f"[TRADE] WARNING: Unknown token {token_id[:30]}...")
+
+        print(
+            f"[TRADE] Position updated -> YES={self.state.positions.yes_tokens}, "
+            f"NO={self.state.positions.no_tokens}"
         )
-        
+
         self.state.health.user_ws_last_msg_ms = event.ts_local_ms
     
     def _reduce_rest_order_ack(self, event: RestOrderAckEvent) -> None:
         """Handle REST order acknowledgment."""
         if event.success:
             logger.debug(f"Order ack: {event.client_req_id} -> {event.order_id}")
+            # Track this order as OURS so we can filter trades
+            if event.order_id:
+                self._our_order_ids.add(event.order_id)
+                print(f"[REDUCER] Tracking our order: {event.order_id[:20]}...")
             # Order will be tracked via WS updates
         else:
             logger.warning(f"Order failed: {event.client_req_id}")
@@ -291,6 +344,26 @@ class StateReducer:
                 logger.info("All connections healthy - resuming NORMAL trading")
                 self.state.risk_mode = RiskMode.NORMAL
     
+    async def drain_pending(self) -> int:
+        """
+        Process all pending events in the queue immediately.
+
+        Call this before reading state to ensure you have the freshest data.
+
+        Returns:
+            Number of events drained
+        """
+        count = 0
+        while True:
+            try:
+                event = self.queue.get_nowait()
+                await self.dispatch(event)
+                self._event_count += 1
+                count += 1
+            except asyncio.QueueEmpty:
+                break
+        return count
+
     def stop(self) -> None:
         """Stop the reducer."""
         self._running = False
