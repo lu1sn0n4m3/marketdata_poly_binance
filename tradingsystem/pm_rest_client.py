@@ -403,8 +403,11 @@ class PolymarketRestClient:
         self._ensure_initialized()
 
         try:
+            from py_clob_client.clob_types import OpenOrderParams
+
             if market_id:
-                response = self._client.get_orders(market=market_id)
+                params = OpenOrderParams(market=market_id)
+                response = self._client.get_orders(params=params)
             else:
                 response = self._client.get_orders()
 

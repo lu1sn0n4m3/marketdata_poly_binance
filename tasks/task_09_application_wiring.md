@@ -84,7 +84,7 @@ class AppConfig:
     def from_env(cls) -> "AppConfig":
         """Load config from environment variables."""
         return cls(
-            market_slug=os.getenv("PM_MARKET_SLUG", ""),
+            market_slug=#get it somehow that workd in the present system,
             pm_api_key=os.getenv("PM_API_KEY", ""),
             pm_api_secret=os.getenv("PM_API_SECRET", ""),
             pm_passphrase=os.getenv("PM_PASSPHRASE", ""),

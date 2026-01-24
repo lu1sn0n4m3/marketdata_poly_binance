@@ -221,48 +221,65 @@ class PolymarketUserWsClient(ThreadedWsClient):
         status = data.get("status", "")
         ts = now_ms()
 
+        # DEBUG: Log raw trade event data
+        logger.debug(f"[TRADE_DEBUG] Raw trade event: {data}")
+
         # Only process confirmed fills
         if status not in ("CONFIRMED", "MINED", "MATCHED"):
             return
 
-        # Taker fill
-        taker_order_id = data.get("taker_order_id", "")
-        if taker_order_id:
-            event = FillEvent(
-                event_type=ExecutorEventType.FILL,
-                ts_local_ms=ts,
-                server_order_id=taker_order_id,
-                token=self._outcome_to_token(data.get("outcome")),
-                side=self._parse_side(data.get("side", "")),
-                price=self._price_to_cents(data.get("price")),
-                size=self._parse_size(data.get("size")),
-                fee=0.0,  # Fee not provided
-                ts_exchange=self._parse_timestamp(data.get("timestamp")),
-            )
-            self._enqueue(event)
+        # Determine if we're taker or maker in this trade
+        trader_side = data.get("trader_side", "")
 
-        # Maker fills (if we're the maker)
-        for maker in data.get("maker_orders", []):
-            maker_order_id = maker.get("order_id", "")
-            if not maker_order_id:
-                continue
+        # Taker fill - only process if WE are the taker
+        if trader_side == "TAKER":
+            taker_order_id = data.get("taker_order_id", "")
+            if taker_order_id:
+                event = FillEvent(
+                    event_type=ExecutorEventType.FILL,
+                    ts_local_ms=ts,
+                    server_order_id=taker_order_id,
+                    token=self._outcome_to_token(data.get("outcome")),
+                    side=self._parse_side(data.get("side", "")),
+                    price=self._price_to_cents(data.get("price")),
+                    size=self._parse_size(data.get("size")),
+                    fee=0.0,
+                    ts_exchange=self._parse_timestamp(data.get("timestamp")),
+                )
+                logger.info(
+                    f"[FILL] TAKER: {event.token.name} {event.side.name} "
+                    f"{event.size}@{event.price}c order={taker_order_id[:16]}..."
+                )
+                self._enqueue(event)
 
-            # Maker is passive side (opposite of trade side)
-            trade_side = self._parse_side(data.get("side", ""))
-            maker_side = Side.SELL if trade_side == Side.BUY else Side.BUY
+        # Maker fills - only process if WE are the maker
+        # Note: maker_orders contains ALL makers in this trade, not just us.
+        # The executor will filter to only update inventory for orders it tracks.
+        elif trader_side == "MAKER":
+            for maker in data.get("maker_orders", []):
+                maker_order_id = maker.get("order_id", "")
+                if not maker_order_id:
+                    continue
 
-            maker_event = FillEvent(
-                event_type=ExecutorEventType.FILL,
-                ts_local_ms=ts,
-                server_order_id=maker_order_id,
-                token=self._outcome_to_token(maker.get("outcome")),
-                side=maker_side,
-                price=self._price_to_cents(maker.get("price")),
-                size=self._parse_size(maker.get("matched_amount")),
-                fee=0.0,
-                ts_exchange=self._parse_timestamp(data.get("timestamp")),
-            )
-            self._enqueue(maker_event)
+                # Use the side directly from the maker order data (not inverted!)
+                maker_side = self._parse_side(maker.get("side", ""))
+
+                maker_event = FillEvent(
+                    event_type=ExecutorEventType.FILL,
+                    ts_local_ms=ts,
+                    server_order_id=maker_order_id,
+                    token=self._outcome_to_token(maker.get("outcome")),
+                    side=maker_side,
+                    price=self._price_to_cents(maker.get("price")),
+                    size=self._parse_size(maker.get("matched_amount")),
+                    fee=0.0,
+                    ts_exchange=self._parse_timestamp(data.get("timestamp")),
+                )
+                logger.debug(
+                    f"[FILL] MAKER candidate: {maker_event.token.name} {maker_event.side.name} "
+                    f"{maker_event.size}@{maker_event.price}c order={maker_order_id[:16]}..."
+                )
+                self._enqueue(maker_event)
 
     def _enqueue(self, event) -> None:
         """
