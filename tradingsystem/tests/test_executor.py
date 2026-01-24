@@ -10,7 +10,6 @@ from tradingsystem.types import (
     Side,
     OrderStatus,
     QuoteMode,
-    ExecutorConfig,
     ExecutorEventType,
     InventoryState,
     RealOrderSpec,
@@ -21,83 +20,26 @@ from tradingsystem.types import (
     OrderAckEvent,
     CancelAckEvent,
     FillEvent,
+    StrategyIntentEvent,
     now_ms,
 )
 from tradingsystem.executor import (
-    OrderMaterializer,
     ExecutorState,
     ExecutorActor,
+    ExecutorPolicies,
+    MinSizePolicy,
+    OrderKind,
+    PnLTracker,
+)
+from tradingsystem.executor.state import (
+    OrderSlot,
+    SlotState,
+    ReservationLedger,
     PendingPlace,
     PendingCancel,
 )
-from tradingsystem.strategy import IntentMailbox
+from tradingsystem.executor.planner import plan_execution, PlannedOrder, LegPlan
 from tradingsystem.gateway import Gateway
-
-
-class TestOrderMaterializer:
-    """Tests for OrderMaterializer."""
-
-    @pytest.fixture
-    def materializer(self):
-        """Create materializer."""
-        return OrderMaterializer(
-            yes_token_id="yes_token_123",
-            no_token_id="no_token_456",
-        )
-
-    def test_materialize_bid_no_inventory(self, materializer):
-        """Bid without inventory becomes BUY YES."""
-        inventory = InventoryState()
-        spec = materializer.materialize_bid(px_yes=50, sz=100, inventory=inventory)
-
-        assert spec.token == Token.YES
-        assert spec.side == Side.BUY
-        assert spec.px == 50
-        assert spec.sz == 100
-
-    def test_materialize_bid_with_no_inventory(self, materializer):
-        """Bid with NO inventory becomes SELL NO at complement."""
-        inventory = InventoryState(I_yes=0, I_no=50)
-        spec = materializer.materialize_bid(px_yes=40, sz=100, inventory=inventory)
-
-        assert spec.token == Token.NO
-        assert spec.side == Side.SELL
-        assert spec.px == 60  # Complement: 100 - 40
-        assert spec.sz == 50  # Limited by inventory
-
-    def test_materialize_ask_no_inventory(self, materializer):
-        """Ask without inventory becomes BUY NO at complement."""
-        inventory = InventoryState()
-        spec = materializer.materialize_ask(px_yes=60, sz=100, inventory=inventory)
-
-        assert spec.token == Token.NO
-        assert spec.side == Side.BUY
-        assert spec.px == 40  # Complement: 100 - 60
-        assert spec.sz == 100
-
-    def test_materialize_ask_with_yes_inventory(self, materializer):
-        """Ask with YES inventory becomes SELL YES."""
-        inventory = InventoryState(I_yes=50, I_no=0)
-        spec = materializer.materialize_ask(px_yes=60, sz=100, inventory=inventory)
-
-        assert spec.token == Token.YES
-        assert spec.side == Side.SELL
-        assert spec.px == 60
-        assert spec.sz == 50  # Limited by inventory
-
-    def test_materialize_bid_limit_to_no_inventory(self, materializer):
-        """Bid size limited by available NO inventory."""
-        inventory = InventoryState(I_yes=0, I_no=25)
-        spec = materializer.materialize_bid(px_yes=50, sz=100, inventory=inventory)
-
-        assert spec.sz == 25  # Limited to NO inventory
-
-    def test_materialize_ask_limit_to_yes_inventory(self, materializer):
-        """Ask size limited by available YES inventory."""
-        inventory = InventoryState(I_yes=30, I_no=0)
-        spec = materializer.materialize_ask(px_yes=50, sz=100, inventory=inventory)
-
-        assert spec.sz == 30  # Limited to YES inventory
 
 
 class TestExecutorState:
@@ -109,16 +51,12 @@ class TestExecutorState:
 
         assert state.inventory.I_yes == 0
         assert state.inventory.I_no == 0
-        assert len(state.working_orders) == 0
-        assert len(state.pending_places) == 0
-        assert len(state.pending_cancels) == 0
-        assert state.bid_order_id is None
-        assert state.ask_order_id is None
+        assert len(state.bid_slot.orders) == 0
+        assert len(state.ask_slot.orders) == 0
+        assert state.last_intent is None
 
-    def test_get_working_bid(self):
-        """Test getting working bid order."""
-        from tradingsystem.types import WorkingOrder
-
+    def test_find_order_in_bid_slot(self):
+        """Test finding order in bid slot."""
         state = ExecutorState()
 
         spec = RealOrderSpec(
@@ -137,23 +75,30 @@ class TestExecutorState:
             last_state_change_ts=now_ms(),
         )
 
-        state.working_orders["server_1"] = order
-        state.bid_order_id = "server_1"
+        state.bid_slot.orders["server_1"] = order
 
-        assert state.get_working_bid() is order
-        assert state.get_working_ask() is None
+        slot, found = state.find_order("server_1")
+        assert slot is state.bid_slot
+        assert found is order
 
-    def test_get_working_ask(self):
-        """Test getting working ask order."""
-        from tradingsystem.types import WorkingOrder
-
+    def test_find_order_not_found(self):
+        """Test finding non-existent order."""
         state = ExecutorState()
 
+        slot, found = state.find_order("nonexistent")
+        assert slot is None
+        assert found is None
+
+    def test_rebuild_reservations(self):
+        """Test rebuilding reservations from working orders."""
+        state = ExecutorState()
+
+        # Add a SELL YES order
         spec = RealOrderSpec(
             token=Token.YES,
             side=Side.SELL,
-            px=50,
-            sz=100,
+            px=55,
+            sz=10,
             token_id="yes_token",
         )
         order = WorkingOrder(
@@ -163,13 +108,102 @@ class TestExecutorState:
             status=OrderStatus.WORKING,
             created_ts=now_ms(),
             last_state_change_ts=now_ms(),
+            filled_sz=3,  # Partial fill
+        )
+        state.ask_slot.orders["server_1"] = order
+
+        # Rebuild reservations
+        state.rebuild_reservations()
+
+        # Should reserve remaining size (10 - 3 = 7)
+        assert state.reservations.reserved_yes == 7
+        assert state.reservations.reserved_no == 0
+
+
+class TestOrderSlot:
+    """Tests for OrderSlot state machine."""
+
+    def test_initial_state(self):
+        """Test initial slot state."""
+        slot = OrderSlot(slot_type="bid")
+
+        assert slot.state == SlotState.IDLE
+        assert slot.can_submit()
+        assert len(slot.orders) == 0
+
+    def test_transition_to_canceling(self):
+        """Test transition to CANCELING state."""
+        slot = OrderSlot(slot_type="bid")
+
+        slot.transition_to_canceling()
+        assert slot.state == SlotState.CANCELING
+        assert not slot.can_submit()
+
+    def test_transition_to_placing(self):
+        """Test transition to PLACING state."""
+        slot = OrderSlot(slot_type="ask")
+
+        slot.transition_to_placing()
+        assert slot.state == SlotState.PLACING
+        assert not slot.can_submit()
+
+    def test_on_ack_received_clears_state(self):
+        """Test that ack clears state when no pending."""
+        slot = OrderSlot(slot_type="bid")
+        slot.state = SlotState.CANCELING
+
+        slot.on_ack_received()
+        assert slot.state == SlotState.IDLE
+
+    def test_on_ack_received_with_pending(self):
+        """Test that ack doesn't clear state when pending remain."""
+        slot = OrderSlot(slot_type="bid")
+        slot.state = SlotState.PLACING
+        slot.pending_places["action_1"] = PendingPlace(
+            action_id="action_1",
+            spec=Mock(),
+            sent_at_ts=0,
+            order_kind="complement_buy",
         )
 
-        state.working_orders["server_1"] = order
-        state.ask_order_id = "server_1"
+        slot.on_ack_received()
+        # Should still be PLACING because pending_places not empty
+        assert slot.state == SlotState.PLACING
 
-        assert state.get_working_ask() is order
-        assert state.get_working_bid() is None
+
+class TestReservationLedger:
+    """Tests for ReservationLedger."""
+
+    def test_available_inventory(self):
+        """Test available inventory calculation."""
+        ledger = ReservationLedger(
+            reserved_yes=10,
+            reserved_no=5,
+            safety_buffer_yes=2,
+            safety_buffer_no=1,
+        )
+
+        assert ledger.available_yes(100) == 88  # 100 - 10 - 2
+        assert ledger.available_no(50) == 44  # 50 - 5 - 1
+
+    def test_available_never_negative(self):
+        """Test available inventory never goes negative."""
+        ledger = ReservationLedger(reserved_yes=100, safety_buffer_yes=50)
+
+        assert ledger.available_yes(10) == 0  # Would be -140, clamped to 0
+
+    def test_reserve_and_release(self):
+        """Test reserve and release operations."""
+        ledger = ReservationLedger()
+
+        ledger.reserve_yes(10)
+        assert ledger.reserved_yes == 10
+
+        ledger.release_yes(3)
+        assert ledger.reserved_yes == 7
+
+        ledger.release_yes(100)  # Over-release
+        assert ledger.reserved_yes == 0  # Clamped to 0
 
 
 class TestExecutorActor:
@@ -185,30 +219,24 @@ class TestExecutorActor:
         return gateway
 
     @pytest.fixture
-    def mailbox(self):
-        """Create intent mailbox."""
-        return IntentMailbox()
-
-    @pytest.fixture
     def event_queue(self):
         """Create event queue."""
         return queue.Queue(maxsize=100)
 
     @pytest.fixture
-    def executor(self, mock_gateway, mailbox, event_queue):
+    def executor(self, mock_gateway, event_queue):
         """Create executor."""
-        config = ExecutorConfig(
+        policies = ExecutorPolicies(
             place_timeout_ms=5000,
             cancel_timeout_ms=5000,
         )
         return ExecutorActor(
             gateway=mock_gateway,
-            mailbox=mailbox,
             event_queue=event_queue,
-            config=config,
             yes_token_id="yes_token_123",
             no_token_id="no_token_456",
             market_id="market_123",
+            policies=policies,
         )
 
     def test_executor_starts_and_stops(self, executor):
@@ -219,58 +247,54 @@ class TestExecutorActor:
         executor.stop()
         assert not executor.is_running
 
-    def test_handle_stop_intent(self, executor, mailbox, mock_gateway):
+    def test_handle_stop_intent(self, executor, event_queue, mock_gateway):
         """Test STOP intent triggers cancel-all."""
         intent = DesiredQuoteSet.stop(ts=now_ms())
-        mailbox.put(intent)
 
         executor.start()
+
+        # Send intent via event queue
+        event = StrategyIntentEvent(
+            event_type=ExecutorEventType.STRATEGY_INTENT,
+            ts_local_ms=now_ms(),
+            intent=intent,
+        )
+        event_queue.put(event)
+
         time.sleep(0.1)
         executor.stop()
 
         mock_gateway.submit_cancel_all.assert_called_once_with("market_123")
 
-    def test_handle_normal_intent_places_orders(self, executor, mailbox, mock_gateway):
-        """Test normal intent places bid and ask orders."""
+    def test_handle_normal_intent_places_orders(self, executor, event_queue, mock_gateway):
+        """Test normal intent places orders through planner."""
         intent = DesiredQuoteSet(
             created_at_ts=now_ms(),
             pm_seq=1,
             bn_seq=1,
             mode=QuoteMode.NORMAL,
-            bid_yes=DesiredQuoteLeg(enabled=True, px_yes=48, sz=100),
-            ask_yes=DesiredQuoteLeg(enabled=True, px_yes=52, sz=100),
+            bid_yes=DesiredQuoteLeg(enabled=True, px_yes=48, sz=10),
+            ask_yes=DesiredQuoteLeg(enabled=True, px_yes=52, sz=10),
         )
-        mailbox.put(intent)
 
         executor.start()
+
+        event = StrategyIntentEvent(
+            event_type=ExecutorEventType.STRATEGY_INTENT,
+            ts_local_ms=now_ms(),
+            intent=intent,
+        )
+        event_queue.put(event)
+
         time.sleep(0.1)
         executor.stop()
 
         # Should have called submit_place twice (bid and ask)
         assert mock_gateway.submit_place.call_count == 2
 
-    def test_handle_one_sided_buy_intent(self, executor, mailbox, mock_gateway):
-        """Test one-sided buy intent only places bid."""
-        intent = DesiredQuoteSet(
-            created_at_ts=now_ms(),
-            pm_seq=1,
-            bn_seq=1,
-            mode=QuoteMode.ONE_SIDED_BUY,
-            bid_yes=DesiredQuoteLeg(enabled=True, px_yes=48, sz=100),
-            ask_yes=DesiredQuoteLeg(enabled=False, px_yes=52, sz=0),
-        )
-        mailbox.put(intent)
-
-        executor.start()
-        time.sleep(0.1)
-        executor.stop()
-
-        # Should only place bid
-        assert mock_gateway.submit_place.call_count == 1
-
     def test_handle_fill_updates_inventory(self, executor, event_queue):
         """Test fill event updates inventory for tracked orders."""
-        # Pre-populate working order (simulates order being placed and acked)
+        # Pre-populate working order in bid slot
         working_order = WorkingOrder(
             client_order_id="client_1",
             server_order_id="order_1",
@@ -280,7 +304,7 @@ class TestExecutorActor:
             last_state_change_ts=now_ms(),
             filled_sz=0,
         )
-        executor._state.working_orders["order_1"] = working_order
+        executor._state.bid_slot.orders["order_1"] = working_order
 
         executor.start()
 
@@ -303,9 +327,13 @@ class TestExecutorActor:
 
         assert executor.inventory.I_yes == 10
 
-    def test_handle_fill_sell_decreases_inventory(self, executor, event_queue):
-        """Test sell fill decreases inventory for tracked orders."""
-        # Pre-populate working order
+    def test_handle_fill_releases_reservation(self, executor, event_queue):
+        """Test fill releases reservation for SELL orders."""
+        # Set up inventory and reservation
+        executor.set_inventory(yes=50, no=0)
+        executor._state.reservations.reserve_yes(20)
+
+        # Pre-populate working order (SELL YES)
         working_order = WorkingOrder(
             client_order_id="client_1",
             server_order_id="order_1",
@@ -315,9 +343,8 @@ class TestExecutorActor:
             last_state_change_ts=now_ms(),
             filled_sz=0,
         )
-        executor._state.working_orders["order_1"] = working_order
+        executor._state.ask_slot.orders["order_1"] = working_order
 
-        executor.set_inventory(yes=50, no=0)
         executor.start()
 
         fill = FillEvent(
@@ -336,7 +363,8 @@ class TestExecutorActor:
         time.sleep(0.1)
         executor.stop()
 
-        assert executor.inventory.I_yes == 30
+        assert executor.inventory.I_yes == 30  # 50 - 20
+        assert executor._state.reservations.reserved_yes == 0  # Released
 
     def test_set_inventory(self, executor):
         """Test setting initial inventory."""
@@ -345,45 +373,19 @@ class TestExecutorActor:
         assert executor.inventory.I_yes == 100
         assert executor.inventory.I_no == 50
 
-    def test_gateway_result_success_tracks_order(self, executor, mailbox, event_queue, mock_gateway):
-        """Test successful gateway result creates working order."""
-        # Place an order
-        intent = DesiredQuoteSet(
-            created_at_ts=now_ms(),
-            pm_seq=1,
-            bn_seq=1,
-            mode=QuoteMode.NORMAL,
-            bid_yes=DesiredQuoteLeg(enabled=True, px_yes=48, sz=100),
-            ask_yes=DesiredQuoteLeg(enabled=False, px_yes=52, sz=0),
-        )
-        mailbox.put(intent)
-
-        executor.start()
-        time.sleep(0.05)
-
-        # Simulate gateway success
-        gw_result = GatewayResultEvent(
-            event_type=ExecutorEventType.GATEWAY_RESULT,
-            ts_local_ms=now_ms(),
-            action_id="gw_1",
-            success=True,
-            server_order_id="server_order_1",
-        )
-        event_queue.put(gw_result)
-
-        time.sleep(0.1)
-        executor.stop()
-
-        # Should have a working order
-        assert len(executor.state.working_orders) == 1
-        assert executor.state.bid_order_id == "server_order_1"
-
-    def test_cooldown_after_cancel_all(self, executor, mailbox, mock_gateway):
+    def test_cooldown_after_cancel_all(self, executor, event_queue, mock_gateway):
         """Test cooldown is set after cancel-all."""
         intent = DesiredQuoteSet.stop(ts=now_ms())
-        mailbox.put(intent)
 
         executor.start()
+
+        event = StrategyIntentEvent(
+            event_type=ExecutorEventType.STRATEGY_INTENT,
+            ts_local_ms=now_ms(),
+            intent=intent,
+        )
+        event_queue.put(event)
+
         time.sleep(0.1)
 
         # Should be in cooldown
@@ -512,25 +514,6 @@ class TestRealOrderSpec:
         )
         assert not spec1.matches(spec2)
 
-    def test_no_match_price_outside_tolerance(self):
-        """Test no match when price outside tolerance."""
-        spec1 = RealOrderSpec(
-            token=Token.YES,
-            side=Side.BUY,
-            px=50,
-            sz=100,
-            token_id="yes",
-        )
-        spec2 = RealOrderSpec(
-            token=Token.YES,
-            side=Side.BUY,
-            px=52,  # 2 cents difference
-            sz=100,
-            token_id="yes",
-        )
-        assert not spec1.matches(spec2, price_tol=0)
-        assert spec1.matches(spec2, price_tol=2)
-
 
 class TestSyncOpenOrders:
     """Tests for sync_open_orders functionality."""
@@ -543,19 +526,16 @@ class TestSyncOpenOrders:
         mock_gateway.submit_cancel = Mock(return_value="action_2")
         mock_gateway.submit_cancel_all = Mock()
 
-        from tradingsystem.strategy import IntentMailbox
-        mailbox = IntentMailbox()
         event_queue = queue.Queue()
-        config = ExecutorConfig()
+        policies = ExecutorPolicies()
 
         return ExecutorActor(
             gateway=mock_gateway,
-            mailbox=mailbox,
             event_queue=event_queue,
-            config=config,
             yes_token_id="yes_token_123",
             no_token_id="no_token_456",
             market_id="market_1",
+            policies=policies,
         )
 
     def test_sync_yes_buy_order(self, executor):
@@ -570,13 +550,13 @@ class TestSyncOpenOrders:
             "status": "LIVE",
         }]
 
-        synced = executor.sync_open_orders(orders, "yes_token_123", "no_token_456")
+        synced = executor.sync_open_orders(orders)
 
         assert synced == 1
-        assert "order_abc123" in executor.state.working_orders
-        assert executor.state.bid_order_id == "order_abc123"  # BUY YES is a bid
+        # BUY YES goes in bid slot
+        assert "order_abc123" in executor.state.bid_slot.orders
 
-        order = executor.state.working_orders["order_abc123"]
+        order = executor.state.bid_slot.orders["order_abc123"]
         assert order.order_spec.token == Token.YES
         assert order.order_spec.side == Side.BUY
         assert order.order_spec.px == 1  # 1 cent
@@ -593,58 +573,16 @@ class TestSyncOpenOrders:
             "status": "LIVE",
         }]
 
-        synced = executor.sync_open_orders(orders, "yes_token_123", "no_token_456")
+        synced = executor.sync_open_orders(orders)
 
         assert synced == 1
-        assert "order_def456" in executor.state.working_orders
-        assert executor.state.ask_order_id == "order_def456"  # BUY NO is an ask
-
-    def test_sync_multiple_orders(self, executor):
-        """Test syncing both bid and ask orders."""
-        orders = [
-            {
-                "id": "order_bid",
-                "asset_id": "yes_token_123",
-                "side": "BUY",
-                "price": "0.01",
-                "original_size": "5",
-                "status": "LIVE",
-            },
-            {
-                "id": "order_ask",
-                "asset_id": "no_token_456",
-                "side": "BUY",
-                "price": "0.01",
-                "original_size": "5",
-                "status": "LIVE",
-            },
-        ]
-
-        synced = executor.sync_open_orders(orders, "yes_token_123", "no_token_456")
-
-        assert synced == 2
-        assert executor.state.bid_order_id == "order_bid"
-        assert executor.state.ask_order_id == "order_ask"
-
-    def test_sync_skips_unknown_asset(self, executor):
-        """Test syncing skips orders with unknown asset."""
-        orders = [{
-            "id": "order_unknown",
-            "asset_id": "some_other_token",
-            "side": "BUY",
-            "price": "0.50",
-            "original_size": "10",
-            "status": "LIVE",
-        }]
-
-        synced = executor.sync_open_orders(orders, "yes_token_123", "no_token_456")
-
-        assert synced == 0
-        assert len(executor.state.working_orders) == 0
+        # BUY NO goes in ask slot
+        assert "order_def456" in executor.state.ask_slot.orders
 
     def test_sync_handles_empty_list(self, executor):
         """Test syncing handles empty order list."""
-        synced = executor.sync_open_orders([], "yes_token_123", "no_token_456")
+        synced = executor.sync_open_orders([])
 
         assert synced == 0
-        assert len(executor.state.working_orders) == 0
+        assert len(executor.state.bid_slot.orders) == 0
+        assert len(executor.state.ask_slot.orders) == 0

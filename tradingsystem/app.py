@@ -8,9 +8,12 @@ Component threading layout:
 - Thread 1: PM Market WS → PolymarketCache
 - Thread 2: PM User WS → Executor event queue
 - Thread 3: Binance Poller → BinanceCache
-- Thread 4: Strategy Runner → Intent Mailbox
+- Thread 4: Strategy Runner → Executor event queue (direct)
 - Thread 5: Executor Actor → Gateway
 - Thread 6: Gateway Worker
+
+Note: The executor uses a unified event queue - all inputs (intents, fills, acks)
+flow through a single queue for deterministic ordering.
 """
 
 import asyncio
@@ -23,7 +26,6 @@ from typing import Optional
 
 from .config import AppConfig
 from .types import (
-    ExecutorConfig,
     MarketInfo,
     now_ms,
 )
@@ -37,9 +39,8 @@ from .strategy import (
     StrategyConfig,
     StrategyInput,
     StrategyRunner,
-    IntentMailbox,
 )
-from .executor import ExecutorActor
+from .executor import ExecutorActor, ExecutorPolicies
 from .gamma_client import GammaClient
 from .market_finder import BitcoinHourlyMarketFinder
 
@@ -82,7 +83,6 @@ class MMApplication:
         self._rest_client: Optional[PolymarketRestClient] = None
         self._gateway: Optional[Gateway] = None
 
-        self._intent_mailbox: Optional[IntentMailbox] = None
         self._strategy_runner: Optional[StrategyRunner] = None
         self._executor: Optional[ExecutorActor] = None
 
@@ -105,11 +105,8 @@ class MMApplication:
         self._pm_cache = PolymarketCache()
         self._bn_cache = BinanceCache()
 
-        # Event queue for executor (fills, acks from User WS)
+        # Event queue for executor (unified: fills, acks, intents from User WS and Strategy)
         self._event_queue = queue.Queue(maxsize=1000)
-
-        # Intent mailbox
-        self._intent_mailbox = IntentMailbox()
 
         # REST client
         self._rest_client = PolymarketRestClient(
@@ -170,11 +167,11 @@ class MMApplication:
         # Strategy
         strategy = self._custom_strategy or DefaultMMStrategy(strategy_config)
 
-        # Strategy runner
+        # Strategy runner - push intents directly to event queue
         self._strategy_runner = StrategyRunner(
             strategy=strategy,
-            mailbox=self._intent_mailbox,
             get_input=self._get_strategy_input,
+            event_queue=self._event_queue,  # Direct to executor event queue
             tick_hz=cfg.strategy_hz,
         )
 
@@ -184,24 +181,27 @@ class MMApplication:
         """Setup executor with market info."""
         cfg = self._config
 
-        executor_config = ExecutorConfig(
-            pm_stale_threshold_ms=cfg.pm_stale_threshold_ms,
-            bn_stale_threshold_ms=cfg.bn_stale_threshold_ms,
+        # Create executor policies from config
+        # Note: top_up_threshold controls queue-preserving behavior:
+        # - Only replace orders on size increase if the increase >= threshold
+        # - This prevents losing queue position on small size changes
+        executor_policies = ExecutorPolicies(
+            min_order_size=5,  # Polymarket minimum
             cancel_timeout_ms=cfg.cancel_timeout_ms,
             place_timeout_ms=cfg.place_timeout_ms,
             cooldown_after_cancel_all_ms=cfg.cooldown_after_cancel_all_ms,
-            gross_cap=cfg.gross_cap,
-            max_position=cfg.max_position,
+            price_tolerance=0,
+            top_up_threshold=10,  # Only replace on size increase >= 10
         )
 
         self._executor = ExecutorActor(
             gateway=self._gateway,
-            mailbox=self._intent_mailbox,
             event_queue=self._event_queue,
-            config=executor_config,
             yes_token_id=market.yes_token_id,
             no_token_id=market.no_token_id,
             market_id=market.condition_id,
+            rest_client=self._rest_client,  # For resync operations
+            policies=executor_policies,
             on_cancel_all=self._on_cancel_all,
         )
 
@@ -221,12 +221,8 @@ class MMApplication:
                 logger.info("No existing open orders found")
                 return
 
-            # Sync into executor state
-            synced = self._executor.sync_open_orders(
-                orders=orders,
-                yes_token_id=market.yes_token_id,
-                no_token_id=market.no_token_id,
-            )
+            # Sync into executor state (uses token IDs from executor init)
+            synced = self._executor.sync_open_orders(orders=orders)
 
             if synced > 0:
                 logger.info(f"Synced {synced} existing open orders")

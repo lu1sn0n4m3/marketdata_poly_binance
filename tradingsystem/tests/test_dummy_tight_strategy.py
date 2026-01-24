@@ -1,8 +1,7 @@
 """Tests for DummyTightStrategy."""
 
 import pytest
-from tradingsystem.dummy_tight_strategy import DummyTightStrategy
-from tradingsystem.strategy import StrategyInput
+from tradingsystem.strategy import DummyTightStrategy, StrategyInput
 from tradingsystem.types import (
     PolymarketBookSnapshot,
     PolymarketBookTop,

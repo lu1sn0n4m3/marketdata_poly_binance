@@ -43,6 +43,14 @@ class WorkingOrder:
     A working order on the exchange.
 
     Tracks order state and filled quantity.
+
+    The `kind` field stores the order's role as assigned by the planner:
+    - "reduce_sell": Selling held inventory to reduce exposure
+    - "open_buy": Buying primary token to open exposure (BUY YES for bid)
+    - "complement_buy": Buying complement token (BUY NO for ask)
+    - None: Unknown (for orders synced from exchange)
+
+    The reconciler uses this to match working orders with planned orders.
     """
     client_order_id: str
     server_order_id: str
@@ -51,6 +59,7 @@ class WorkingOrder:
     created_ts: int
     last_state_change_ts: int
     filled_sz: int = 0
+    kind: str | None = None  # Order role: "reduce_sell", "open_buy", "complement_buy", or None
 
     @property
     def remaining_sz(self) -> int:

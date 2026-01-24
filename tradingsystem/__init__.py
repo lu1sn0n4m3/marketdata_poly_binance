@@ -81,14 +81,29 @@ from .feeds import (
 
 # REST client and Gateway
 from .pm_rest_client import PolymarketRestClient, OrderResult, CancelResult, OrderType
-from .gateway import Gateway, GatewayWorker, GatewayStats
+from .gateway import Gateway, GatewayWorker, GatewayStats, ActionDeque
 
 # Strategy
-from .strategy import Strategy, DefaultMMStrategy, StrategyRunner, StrategyInput, StrategyConfig, IntentMailbox
-from .dummy_strategy import DummyStrategy
+from .strategy import (
+    Strategy,
+    DefaultMMStrategy,
+    StrategyRunner,
+    StrategyInput,
+    StrategyConfig,
+    IntentMailbox,
+    DummyStrategy,
+    DummyTightStrategy,
+)
 
-# Executor
-from .executor import ExecutorActor, OrderMaterializer, ExecutorState
+# Executor (new package)
+from .executor import (
+    ExecutorActor,
+    ExecutorState,
+    ExecutorPolicies,
+    MinSizePolicy,
+    OrderKind,
+    PnLTracker,
+)
 
 # Application
 from .config import AppConfig
@@ -168,18 +183,23 @@ __all__ = [
     "Gateway",
     "GatewayWorker",
     "GatewayStats",
+    "ActionDeque",
     # Strategy
     "Strategy",
     "DefaultMMStrategy",
     "DummyStrategy",
+    "DummyTightStrategy",
     "StrategyRunner",
     "StrategyInput",
     "StrategyConfig",
     "IntentMailbox",
     # Executor
     "ExecutorActor",
-    "OrderMaterializer",
     "ExecutorState",
+    "ExecutorPolicies",
+    "MinSizePolicy",
+    "OrderKind",
+    "PnLTracker",
     # Application
     "AppConfig",
     "MMApplication",
