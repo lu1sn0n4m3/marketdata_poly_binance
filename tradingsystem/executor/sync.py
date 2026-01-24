@@ -163,7 +163,22 @@ def sync_open_orders(
                     sz=size,
                 )
 
-                # Create WorkingOrder
+                # Classify as bid or ask based on token/side
+                # Bid: BUY YES or SELL NO (at complement)
+                # Ask: SELL YES or BUY NO (at complement)
+                is_bid = (token == Token.YES and side == Side.BUY) or \
+                         (token == Token.NO and side == Side.SELL)
+
+                # Infer kind from (side, token) for synced orders
+                # This ensures all orders have a kind, avoiding inference in reconciler
+                if side == Side.SELL:
+                    inferred_kind = "reduce_sell"
+                elif token == Token.YES:
+                    inferred_kind = "open_buy"  # BUY YES = opening primary exposure
+                else:
+                    inferred_kind = "complement_buy"  # BUY NO = complement buy
+
+                # Create WorkingOrder with inferred kind
                 working_order = WorkingOrder(
                     client_order_id=f"synced_{order_id}",
                     server_order_id=order_id,
@@ -172,13 +187,8 @@ def sync_open_orders(
                     created_ts=ts,
                     last_state_change_ts=ts,
                     filled_sz=filled,
+                    kind=inferred_kind,  # Set kind at sync time
                 )
-
-                # Classify as bid or ask based on token/side
-                # Bid: BUY YES or SELL NO (at complement)
-                # Ask: SELL YES or BUY NO (at complement)
-                is_bid = (token == Token.YES and side == Side.BUY) or \
-                         (token == Token.NO and side == Side.SELL)
 
                 if is_bid:
                     state.bid_slot.orders[order_id] = working_order

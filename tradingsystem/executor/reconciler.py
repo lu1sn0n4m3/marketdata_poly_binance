@@ -242,14 +242,22 @@ def _get_kind(order: "WorkingOrder", slot_type: str) -> OrderKind:
     """
     Get OrderKind for a working order.
 
-    Uses stored kind if available (preferred - set by planner).
-    Falls back to inference only for synced orders where kind is unknown.
+    Uses stored kind (preferred - set by planner or at sync time).
+    Falls back to inference ONLY as emergency fallback - this should not happen
+    in normal operation since both planner and sync set kind.
     """
     # Use stored kind if available
     if order.kind is not None:
         return _kind_str_to_enum(order.kind)
 
-    # Fallback: infer from (side, token) - only for synced orders
+    # WARNING: kind=None should not happen after planner or sync sets it
+    # This is an emergency fallback - log warning for visibility
+    logger.warning(
+        f"Order {order.server_order_id[:20]}... has kind=None - "
+        f"inferring from spec (this should not happen in normal operation)"
+    )
+
+    # Fallback: infer from (side, token)
     return _infer_kind_from_spec(order)
 
 
