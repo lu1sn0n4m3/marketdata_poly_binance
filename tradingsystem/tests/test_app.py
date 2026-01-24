@@ -9,7 +9,7 @@ from unittest.mock import Mock, MagicMock, patch
 from tradingsystem.config import AppConfig
 from tradingsystem.feeds import BinanceFeed
 from tradingsystem.caches import BinanceCache
-from tradingsystem.mm_types import MarketInfo
+from tradingsystem.types import MarketInfo
 
 
 class TestAppConfig:
@@ -159,7 +159,7 @@ class TestMMApplicationComponents:
     def test_strategy_input_construction(self):
         """Test strategy input is built correctly from caches."""
         from tradingsystem.caches import PolymarketCache, BinanceCache
-        from tradingsystem.mm_types import InventoryState
+        from tradingsystem.types import InventoryState
         from tradingsystem.strategy import StrategyInput
 
         pm_cache = PolymarketCache()
@@ -199,7 +199,7 @@ class TestMMApplicationComponents:
 
     def test_event_queue_integration(self):
         """Test event queue between components."""
-        from tradingsystem.mm_types import FillEvent, ExecutorEventType, Token, Side, now_ms
+        from tradingsystem.types import FillEvent, ExecutorEventType, Token, Side, now_ms
 
         event_queue = queue.Queue(maxsize=100)
 
@@ -226,7 +226,7 @@ class TestMMApplicationComponents:
     def test_intent_mailbox_integration(self):
         """Test intent mailbox coalescing."""
         from tradingsystem.strategy import IntentMailbox
-        from tradingsystem.mm_types import DesiredQuoteSet, now_ms
+        from tradingsystem.types import DesiredQuoteSet, now_ms
 
         mailbox = IntentMailbox()
 

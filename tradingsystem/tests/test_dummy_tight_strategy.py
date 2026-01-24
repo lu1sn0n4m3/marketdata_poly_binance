@@ -3,9 +3,9 @@
 import pytest
 from tradingsystem.dummy_tight_strategy import DummyTightStrategy
 from tradingsystem.strategy import StrategyInput
-from tradingsystem.mm_types import (
-    PMBookSnapshot,
-    PMBookTop,
+from tradingsystem.types import (
+    PolymarketBookSnapshot,
+    PolymarketBookTop,
     MarketSnapshotMeta,
     InventoryState,
     QuoteMode,
@@ -16,7 +16,7 @@ from tradingsystem.mm_types import (
 @pytest.fixture
 def mock_pm_book():
     """Create a mock PM book with realistic BBO."""
-    return PMBookSnapshot(
+    return PolymarketBookSnapshot(
         meta=MarketSnapshotMeta(
             monotonic_ts=now_ms(),
             wall_ts=None,
@@ -26,13 +26,13 @@ def mock_pm_book():
         market_id="market_123",
         yes_token_id="yes_token",
         no_token_id="no_token",
-        yes_top=PMBookTop(
+        yes_top=PolymarketBookTop(
             best_bid_px=48,
             best_bid_sz=100,
             best_ask_px=52,
             best_ask_sz=100,
         ),
-        no_top=PMBookTop(
+        no_top=PolymarketBookTop(
             best_bid_px=48,
             best_bid_sz=100,
             best_ask_px=52,

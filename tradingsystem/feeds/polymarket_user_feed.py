@@ -14,7 +14,7 @@ from typing import Optional, Callable
 import orjson
 
 from .websocket_base import ThreadedWsClient
-from ..mm_types import (
+from ..types import (
     Token,
     Side,
     OrderStatus,

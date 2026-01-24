@@ -5,7 +5,7 @@ import queue
 import pytest
 from unittest.mock import Mock, MagicMock, patch
 
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     Token,
     Side,
     GatewayActionType,

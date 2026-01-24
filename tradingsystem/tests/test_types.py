@@ -1,7 +1,7 @@
-"""Tests for mm_types.py - Core data types."""
+"""Tests for types.py - Core data types."""
 
 import pytest
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     # Enums
     Token,
     Side,
@@ -9,9 +9,9 @@ from tradingsystem.mm_types import (
     QuoteMode,
     # Snapshot types
     MarketSnapshotMeta,
-    PMBookTop,
-    PMBookSnapshot,
-    BNSnapshot,
+    PolymarketBookTop,
+    PolymarketBookSnapshot,
+    BinanceSnapshot,
     # State types
     InventoryState,
     # Strategy types
@@ -43,41 +43,41 @@ class TestMarketSnapshotMeta:
         assert meta.age_ms(2000) == 1000
 
 
-class TestPMBookTop:
-    """Tests for PMBookTop."""
+class TestPolymarketBookTop:
+    """Tests for PolymarketBookTop."""
 
     def test_mid_px(self):
         """Test mid price calculation."""
-        top = PMBookTop(best_bid_px=50, best_bid_sz=100, best_ask_px=52, best_ask_sz=100)
+        top = PolymarketBookTop(best_bid_px=50, best_bid_sz=100, best_ask_px=52, best_ask_sz=100)
         assert top.mid_px == 51
 
     def test_mid_px_no_quotes(self):
         """Test mid price with no valid quotes."""
-        top = PMBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
+        top = PolymarketBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
         assert top.mid_px == 50
 
     def test_spread(self):
         """Test spread calculation."""
-        top = PMBookTop(best_bid_px=48, best_bid_sz=100, best_ask_px=52, best_ask_sz=100)
+        top = PolymarketBookTop(best_bid_px=48, best_bid_sz=100, best_ask_px=52, best_ask_sz=100)
         assert top.spread == 4
 
     def test_has_bid_ask(self):
         """Test bid/ask presence detection."""
-        top = PMBookTop(best_bid_px=50, best_bid_sz=100, best_ask_px=52, best_ask_sz=0)
+        top = PolymarketBookTop(best_bid_px=50, best_bid_sz=100, best_ask_px=52, best_ask_sz=0)
         assert top.has_bid is True
         assert top.has_ask is False
 
 
-class TestPMBookSnapshot:
-    """Tests for PMBookSnapshot."""
+class TestPolymarketBookSnapshot:
+    """Tests for PolymarketBookSnapshot."""
 
     def test_yes_mid(self):
         """Test YES mid price."""
         meta = MarketSnapshotMeta(monotonic_ts=1000, wall_ts=None, feed_seq=1, source="PM")
-        yes_top = PMBookTop(best_bid_px=55, best_bid_sz=100, best_ask_px=57, best_ask_sz=100)
-        no_top = PMBookTop(best_bid_px=43, best_bid_sz=100, best_ask_px=45, best_ask_sz=100)
+        yes_top = PolymarketBookTop(best_bid_px=55, best_bid_sz=100, best_ask_px=57, best_ask_sz=100)
+        no_top = PolymarketBookTop(best_bid_px=43, best_bid_sz=100, best_ask_px=45, best_ask_sz=100)
 
-        snapshot = PMBookSnapshot(
+        snapshot = PolymarketBookSnapshot(
             meta=meta,
             market_id="0x123",
             yes_token_id="yes_token",
@@ -91,10 +91,10 @@ class TestPMBookSnapshot:
     def test_synthetic_mid_from_yes(self):
         """Test synthetic mid uses YES when available."""
         meta = MarketSnapshotMeta(monotonic_ts=1000, wall_ts=None, feed_seq=1, source="PM")
-        yes_top = PMBookTop(best_bid_px=55, best_bid_sz=100, best_ask_px=57, best_ask_sz=100)
-        no_top = PMBookTop(best_bid_px=43, best_bid_sz=100, best_ask_px=45, best_ask_sz=100)
+        yes_top = PolymarketBookTop(best_bid_px=55, best_bid_sz=100, best_ask_px=57, best_ask_sz=100)
+        no_top = PolymarketBookTop(best_bid_px=43, best_bid_sz=100, best_ask_px=45, best_ask_sz=100)
 
-        snapshot = PMBookSnapshot(
+        snapshot = PolymarketBookSnapshot(
             meta=meta,
             market_id="0x123",
             yes_token_id="yes_token",
@@ -106,13 +106,13 @@ class TestPMBookSnapshot:
         assert snapshot.synthetic_mid == 56
 
 
-class TestBNSnapshot:
-    """Tests for BNSnapshot."""
+class TestBinanceSnapshot:
+    """Tests for BinanceSnapshot."""
 
     def test_mid_px(self):
         """Test mid price calculation."""
         meta = MarketSnapshotMeta(monotonic_ts=1000, wall_ts=None, feed_seq=1, source="BN")
-        snapshot = BNSnapshot(
+        snapshot = BinanceSnapshot(
             meta=meta,
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -123,7 +123,7 @@ class TestBNSnapshot:
     def test_p_yes_cents(self):
         """Test probability to cents conversion."""
         meta = MarketSnapshotMeta(monotonic_ts=1000, wall_ts=None, feed_seq=1, source="BN")
-        snapshot = BNSnapshot(
+        snapshot = BinanceSnapshot(
             meta=meta,
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -135,7 +135,7 @@ class TestBNSnapshot:
     def test_p_yes_cents_clamping(self):
         """Test probability clamping to 1-99."""
         meta = MarketSnapshotMeta(monotonic_ts=1000, wall_ts=None, feed_seq=1, source="BN")
-        snapshot = BNSnapshot(
+        snapshot = BinanceSnapshot(
             meta=meta,
             symbol="BTCUSDT",
             best_bid_px=100000.0,

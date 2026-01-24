@@ -7,7 +7,7 @@ A simplified, efficient market-making system for Polymarket Bitcoin hourly marke
 __version__ = "0.1.0"
 
 # Core types
-from .mm_types import (
+from .types import (
     # Enums
     Token,
     Side,
@@ -17,9 +17,9 @@ from .mm_types import (
     GatewayActionType,
     # Snapshot types
     MarketSnapshotMeta,
-    PMBookTop,
-    PMBookSnapshot,
-    BNSnapshot,
+    PolymarketBookTop,
+    PolymarketBookSnapshot,
+    BinanceSnapshot,
     # State types
     InventoryState,
     RiskState,
@@ -106,9 +106,9 @@ __all__ = [
     "GatewayActionType",
     # Snapshot types
     "MarketSnapshotMeta",
-    "PMBookTop",
-    "PMBookSnapshot",
-    "BNSnapshot",
+    "PolymarketBookTop",
+    "PolymarketBookSnapshot",
+    "BinanceSnapshot",
     # State types
     "InventoryState",
     "RiskState",

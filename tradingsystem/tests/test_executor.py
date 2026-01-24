@@ -5,7 +5,7 @@ import queue
 import pytest
 from unittest.mock import Mock, MagicMock
 
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     Token,
     Side,
     OrderStatus,
@@ -117,7 +117,7 @@ class TestExecutorState:
 
     def test_get_working_bid(self):
         """Test getting working bid order."""
-        from tradingsystem.mm_types import WorkingOrder
+        from tradingsystem.types import WorkingOrder
 
         state = ExecutorState()
 
@@ -145,7 +145,7 @@ class TestExecutorState:
 
     def test_get_working_ask(self):
         """Test getting working ask order."""
-        from tradingsystem.mm_types import WorkingOrder
+        from tradingsystem.types import WorkingOrder
 
         state = ExecutorState()
 

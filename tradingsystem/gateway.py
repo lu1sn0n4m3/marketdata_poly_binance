@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-from .mm_types import (
+from .types import (
     GatewayActionType,
     GatewayAction,
     GatewayResult,

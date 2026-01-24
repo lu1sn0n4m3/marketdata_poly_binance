@@ -11,9 +11,9 @@ Maintains atomic snapshots of Binance BTC market data including:
 from typing import Optional
 
 from ..snapshot_store import LatestSnapshotStore
-from ..mm_types import (
+from ..types import (
     MarketSnapshotMeta,
-    BNSnapshot,
+    BinanceSnapshot,
     now_ms,
     wall_ms,
 )
@@ -28,14 +28,14 @@ class BinanceCache:
     """
 
     def __init__(self):
-        self._store = LatestSnapshotStore[BNSnapshot]()
+        self._store = LatestSnapshotStore[BinanceSnapshot]()
         self._poller_seq: int = 0
 
     def update_from_poll(self, raw_snapshot: dict) -> int:
         """
         Update from polled HTTP response (binance_pricer schema).
 
-        Converts binance_pricer BinanceSnapshot schema to internal BNSnapshot.
+        Converts binance_pricer BinanceSnapshot schema to internal BinanceSnapshot.
 
         Args:
             raw_snapshot: Dictionary from binance_pricer HTTP endpoint
@@ -56,7 +56,7 @@ class BinanceCache:
         # Extract features dict
         features = raw_snapshot.get("features", {})
 
-        snapshot = BNSnapshot(
+        snapshot = BinanceSnapshot(
             meta=meta,
             symbol=raw_snapshot.get("symbol", "BTCUSDT"),
             best_bid_px=raw_snapshot.get("bbo_bid", 0.0) or 0.0,
@@ -124,7 +124,7 @@ class BinanceCache:
             source="BN",
         )
 
-        snapshot = BNSnapshot(
+        snapshot = BinanceSnapshot(
             meta=meta,
             symbol=symbol,
             best_bid_px=best_bid_px,
@@ -145,7 +145,7 @@ class BinanceCache:
 
         return self._store.publish(snapshot)
 
-    def get_latest(self) -> tuple[Optional[BNSnapshot], int]:
+    def get_latest(self) -> tuple[Optional[BinanceSnapshot], int]:
         """
         Get latest snapshot and sequence.
 
@@ -232,5 +232,5 @@ class BinanceCache:
 
     def clear(self) -> None:
         """Clear cache state (for hour transitions)."""
-        self._store = LatestSnapshotStore[BNSnapshot]()
+        self._store = LatestSnapshotStore[BinanceSnapshot]()
         self._poller_seq = 0

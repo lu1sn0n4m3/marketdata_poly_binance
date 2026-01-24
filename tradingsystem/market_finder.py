@@ -16,7 +16,7 @@ from typing import Optional, Callable, Awaitable
 from zoneinfo import ZoneInfo
 
 from .gamma_client import GammaClient, GammaAPIError
-from .mm_types import MarketInfo
+from .types import MarketInfo
 
 logger = logging.getLogger(__name__)
 

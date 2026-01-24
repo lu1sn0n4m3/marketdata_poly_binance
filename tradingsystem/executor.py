@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
-from .mm_types import (
+from .types import (
     Token,
     Side,
     OrderStatus,
@@ -189,7 +189,7 @@ class PnLTracker:
 
         Returns: (realized_pnl_this_fill, current_avg_cost_basis)
         """
-        from .mm_types import Side, Token
+        from .types import Side, Token
 
         self.fills.append(FillRecord(ts, token, side, size, price, order_id))
 

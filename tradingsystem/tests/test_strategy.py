@@ -3,13 +3,13 @@
 import time
 import pytest
 
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     Token,
     QuoteMode,
     InventoryState,
-    PMBookSnapshot,
-    PMBookTop,
-    BNSnapshot,
+    PolymarketBookSnapshot,
+    PolymarketBookTop,
+    BinanceSnapshot,
     MarketSnapshotMeta,
     DesiredQuoteSet,
     now_ms,
@@ -364,9 +364,9 @@ class TestStrategyRunner:
 # =============================================================================
 
 
-def _create_pm_book() -> PMBookSnapshot:
+def _create_pm_book() -> PolymarketBookSnapshot:
     """Create a test PM book."""
-    return PMBookSnapshot(
+    return PolymarketBookSnapshot(
         meta=MarketSnapshotMeta(
             monotonic_ts=now_ms(),
             wall_ts=None,
@@ -376,13 +376,13 @@ def _create_pm_book() -> PMBookSnapshot:
         market_id="test_market",
         yes_token_id="yes_token_123",
         no_token_id="no_token_456",
-        yes_top=PMBookTop(
+        yes_top=PolymarketBookTop(
             best_bid_px=48,
             best_bid_sz=100,
             best_ask_px=52,
             best_ask_sz=100,
         ),
-        no_top=PMBookTop(
+        no_top=PolymarketBookTop(
             best_bid_px=48,
             best_bid_sz=100,
             best_ask_px=52,

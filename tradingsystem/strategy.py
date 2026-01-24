@@ -18,9 +18,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-from .mm_types import (
-    PMBookSnapshot,
-    BNSnapshot,
+from .types import (
+    PolymarketBookSnapshot,
+    BinanceSnapshot,
     InventoryState,
     QuoteMode,
     DesiredQuoteSet,
@@ -44,8 +44,8 @@ class StrategyInput:
     Strategy is stateless - all state comes through this.
     """
     # Market data
-    pm_book: Optional[PMBookSnapshot]
-    bn_snap: Optional[BNSnapshot]
+    pm_book: Optional[PolymarketBookSnapshot]
+    bn_snap: Optional[BinanceSnapshot]
 
     # Inventory
     inventory: InventoryState

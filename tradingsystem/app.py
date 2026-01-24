@@ -22,7 +22,7 @@ import time
 from typing import Optional
 
 from .config import AppConfig
-from .mm_types import (
+from .types import (
     ExecutorConfig,
     MarketInfo,
     now_ms,
@@ -249,7 +249,7 @@ class MMApplication:
         if self._executor:
             inventory = self._executor.inventory
         else:
-            from .mm_types import InventoryState
+            from .types import InventoryState
             inventory = InventoryState()
 
         # Get fair price from BN cache

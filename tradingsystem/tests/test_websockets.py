@@ -9,7 +9,7 @@ import orjson
 from tradingsystem.feeds import ExponentialBackoff, ThreadedWsClient
 from tradingsystem.feeds import PolymarketMarketFeed, PolymarketUserFeed
 from tradingsystem.caches import PolymarketCache
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     Token,
     Side,
     OrderStatus,

@@ -11,7 +11,7 @@ plumbing without risk of actual fills.
 
 import logging
 from .strategy import Strategy, StrategyInput
-from .mm_types import (
+from .types import (
     DesiredQuoteSet,
     DesiredQuoteLeg,
     QuoteMode,

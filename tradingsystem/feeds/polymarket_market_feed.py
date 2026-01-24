@@ -14,7 +14,7 @@ import orjson
 
 from .websocket_base import ThreadedWsClient
 from ..caches import PolymarketCache
-from ..mm_types import price_to_cents
+from ..types import price_to_cents
 
 logger = logging.getLogger(__name__)
 

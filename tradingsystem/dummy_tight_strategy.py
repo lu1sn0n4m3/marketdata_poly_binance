@@ -16,7 +16,7 @@ This tests:
 
 import logging
 from .strategy import Strategy, StrategyInput
-from .mm_types import (
+from .types import (
     DesiredQuoteSet,
     DesiredQuoteLeg,
     QuoteMode,

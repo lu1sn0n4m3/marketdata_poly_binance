@@ -5,11 +5,11 @@ import threading
 import time
 from tradingsystem.snapshot_store import LatestSnapshotStore
 from tradingsystem.caches import PolymarketCache, BinanceCache
-from tradingsystem.mm_types import (
+from tradingsystem.types import (
     MarketSnapshotMeta,
-    PMBookTop,
-    PMBookSnapshot,
-    BNSnapshot,
+    PolymarketBookTop,
+    PolymarketBookSnapshot,
+    BinanceSnapshot,
     now_ms,
 )
 
@@ -420,8 +420,8 @@ class TestBinanceCache:
         assert snapshot.p_yes_cents == 99
 
 
-class TestBNSnapshotProperties:
-    """Tests for BNSnapshot computed properties."""
+class TestBinanceSnapshotProperties:
+    """Tests for BinanceSnapshot computed properties."""
 
     def test_price_vs_open_none_when_no_open(self):
         """Test price_vs_open returns None when no open price."""

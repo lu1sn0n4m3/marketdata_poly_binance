@@ -12,10 +12,10 @@ from collections import deque
 from typing import Optional
 
 from ..snapshot_store import LatestSnapshotStore
-from ..mm_types import (
+from ..types import (
     MarketSnapshotMeta,
-    PMBookTop,
-    PMBookSnapshot,
+    PolymarketBookTop,
+    PolymarketBookSnapshot,
     now_ms,
     wall_ms,
 )
@@ -41,7 +41,7 @@ class PolymarketCache:
         Args:
             history_size: Number of historical mid prices to retain
         """
-        self._store = LatestSnapshotStore[PMBookSnapshot]()
+        self._store = LatestSnapshotStore[PolymarketBookSnapshot]()
         self._history: deque[tuple[int, int]] = deque(maxlen=history_size)
         self._history_size = history_size
 
@@ -95,24 +95,24 @@ class PolymarketCache:
         # Build TOB objects
         # Default: no bid (0), ask at 100 (no liquidity)
         if yes_bbo:
-            yes_top = PMBookTop(
+            yes_top = PolymarketBookTop(
                 best_bid_px=yes_bbo[0],
                 best_bid_sz=yes_bbo[1],
                 best_ask_px=yes_bbo[2],
                 best_ask_sz=yes_bbo[3],
             )
         else:
-            yes_top = PMBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
+            yes_top = PolymarketBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
 
         if no_bbo:
-            no_top = PMBookTop(
+            no_top = PolymarketBookTop(
                 best_bid_px=no_bbo[0],
                 best_bid_sz=no_bbo[1],
                 best_ask_px=no_bbo[2],
                 best_ask_sz=no_bbo[3],
             )
         else:
-            no_top = PMBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
+            no_top = PolymarketBookTop(best_bid_px=0, best_bid_sz=0, best_ask_px=100, best_ask_sz=0)
 
         meta = MarketSnapshotMeta(
             monotonic_ts=ts,
@@ -121,7 +121,7 @@ class PolymarketCache:
             source="PM",
         )
 
-        snapshot = PMBookSnapshot(
+        snapshot = PolymarketBookSnapshot(
             meta=meta,
             market_id=mid,
             yes_token_id=yid,
@@ -189,7 +189,7 @@ class PolymarketCache:
             no_bbo=(bid_px, bid_sz, ask_px, ask_sz),
         )
 
-    def get_latest(self) -> tuple[Optional[PMBookSnapshot], int]:
+    def get_latest(self) -> tuple[Optional[PolymarketBookSnapshot], int]:
         """
         Get latest snapshot and sequence.
 
@@ -274,5 +274,5 @@ class PolymarketCache:
 
     def clear(self) -> None:
         """Clear cache state (for market transitions)."""
-        self._store = LatestSnapshotStore[PMBookSnapshot]()
+        self._store = LatestSnapshotStore[PolymarketBookSnapshot]()
         self._history.clear()

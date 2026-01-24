@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 
-from tradingsystem.mm_types import Token, Side, RealOrderSpec, ExecutorEventType
+from tradingsystem.types import Token, Side, RealOrderSpec, ExecutorEventType
 from tradingsystem.gamma_client import GammaClient
 from tradingsystem.market_finder import BitcoinHourlyMarketFinder, get_current_hour_et
 from tradingsystem.pm_rest_client import PolymarketRestClient
