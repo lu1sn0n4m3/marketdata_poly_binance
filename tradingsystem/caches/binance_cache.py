@@ -10,8 +10,8 @@ Maintains atomic snapshots of Binance BTC market data including:
 
 from typing import Optional
 
-from .snapshot_store import LatestSnapshotStore
-from .mm_types import (
+from ..snapshot_store import LatestSnapshotStore
+from ..mm_types import (
     MarketSnapshotMeta,
     BNSnapshot,
     now_ms,
@@ -19,11 +19,11 @@ from .mm_types import (
 )
 
 
-class BNCache:
+class BinanceCache:
     """
     Binance snapshot cache.
 
-    Updated by SnapshotPoller from binance_pricer HTTP endpoint.
+    Updated by BinanceFeed from binance_pricer HTTP endpoint.
     Thread-safe for single writer (poller), multiple readers (Strategy).
     """
 

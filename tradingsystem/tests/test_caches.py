@@ -1,11 +1,10 @@
-"""Tests for snapshot caches - PMCache and BNCache."""
+"""Tests for snapshot caches - PolymarketCache and BinanceCache."""
 
 import pytest
 import threading
 import time
 from tradingsystem.snapshot_store import LatestSnapshotStore
-from tradingsystem.pm_cache import PMCache
-from tradingsystem.bn_cache import BNCache
+from tradingsystem.caches import PolymarketCache, BinanceCache
 from tradingsystem.mm_types import (
     MarketSnapshotMeta,
     PMBookTop,
@@ -99,12 +98,12 @@ class TestLatestSnapshotStore:
             assert seq > 0
 
 
-class TestPMCache:
-    """Tests for PMCache."""
+class TestPolymarketCache:
+    """Tests for PolymarketCache."""
 
     def test_initial_state(self):
         """Test initial state."""
-        cache = PMCache()
+        cache = PolymarketCache()
         assert cache.has_data is False
         assert cache.seq == 0
         snapshot, seq = cache.get_latest()
@@ -112,7 +111,7 @@ class TestPMCache:
 
     def test_set_market(self):
         """Test setting market identity."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.set_market("condition_123", "yes_token", "no_token")
         # Update to trigger snapshot creation
         cache.update_from_ws(
@@ -126,7 +125,7 @@ class TestPMCache:
 
     def test_update_from_ws(self):
         """Test updating from WebSocket data."""
-        cache = PMCache()
+        cache = PolymarketCache()
         seq = cache.update_from_ws(
             yes_bbo=(50, 100, 52, 150),
             no_bbo=(48, 80, 50, 120),
@@ -145,7 +144,7 @@ class TestPMCache:
 
     def test_update_yes_book_only(self):
         """Test partial update for YES book only."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(
             yes_bbo=(50, 100, 52, 100),
             no_bbo=(48, 100, 50, 100),
@@ -161,7 +160,7 @@ class TestPMCache:
 
     def test_update_no_book_only(self):
         """Test partial update for NO book only."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(
             yes_bbo=(50, 100, 52, 100),
             no_bbo=(48, 100, 50, 100),
@@ -176,7 +175,7 @@ class TestPMCache:
 
     def test_default_bbo_when_none(self):
         """Test default BBO values when data is None."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(yes_bbo=None, no_bbo=None)
         snapshot, _ = cache.get_latest()
         # Defaults: no bid (0), ask at 100
@@ -187,7 +186,7 @@ class TestPMCache:
 
     def test_age_and_staleness(self):
         """Test age calculation and staleness detection."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(yes_bbo=(50, 100, 52, 100), no_bbo=None)
 
         # Immediately after update, age should be small
@@ -198,13 +197,13 @@ class TestPMCache:
 
     def test_staleness_with_no_data(self):
         """Test staleness returns True when no data."""
-        cache = PMCache()
+        cache = PolymarketCache()
         assert cache.is_stale() is True
         assert cache.get_age_ms() == 999999
 
     def test_mid_history(self):
         """Test mid price history tracking."""
-        cache = PMCache(history_size=5)
+        cache = PolymarketCache(history_size=5)
         for bid in range(40, 60, 2):
             cache.update_from_ws(
                 yes_bbo=(bid, 100, bid + 2, 100),
@@ -219,7 +218,7 @@ class TestPMCache:
 
     def test_recent_mid_change(self):
         """Test mid price change calculation."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(yes_bbo=(50, 100, 52, 100), no_bbo=None)
         time.sleep(0.01)
         cache.update_from_ws(yes_bbo=(54, 100, 56, 100), no_bbo=None)
@@ -230,7 +229,7 @@ class TestPMCache:
 
     def test_clear(self):
         """Test clearing cache."""
-        cache = PMCache()
+        cache = PolymarketCache()
         cache.update_from_ws(yes_bbo=(50, 100, 52, 100), no_bbo=None)
         assert cache.has_data is True
 
@@ -239,18 +238,18 @@ class TestPMCache:
         assert cache.seq == 0
 
 
-class TestBNCache:
-    """Tests for BNCache."""
+class TestBinanceCache:
+    """Tests for BinanceCache."""
 
     def test_initial_state(self):
         """Test initial state."""
-        cache = BNCache()
+        cache = BinanceCache()
         assert cache.has_data is False
         assert cache.seq == 0
 
     def test_update_from_poll(self):
         """Test updating from polled data."""
-        cache = BNCache()
+        cache = BinanceCache()
         raw = {
             "symbol": "BTCUSDT",
             "bbo_bid": 100000.0,
@@ -282,7 +281,7 @@ class TestBNCache:
 
     def test_update_direct(self):
         """Test direct update method."""
-        cache = BNCache()
+        cache = BinanceCache()
         seq = cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -301,7 +300,7 @@ class TestBNCache:
 
     def test_mid_price(self):
         """Test mid price calculation."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -311,7 +310,7 @@ class TestBNCache:
 
     def test_p_yes_accessor(self):
         """Test p_yes accessor."""
-        cache = BNCache()
+        cache = BinanceCache()
         assert cache.get_p_yes() is None
 
         cache.update_direct(
@@ -324,7 +323,7 @@ class TestBNCache:
 
     def test_time_remaining(self):
         """Test time remaining accessor."""
-        cache = BNCache()
+        cache = BinanceCache()
         assert cache.get_time_remaining_ms() == 0
 
         cache.update_direct(
@@ -337,7 +336,7 @@ class TestBNCache:
 
     def test_age_and_staleness(self):
         """Test age calculation and staleness detection."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -356,12 +355,12 @@ class TestBNCache:
 
     def test_staleness_with_no_data(self):
         """Test staleness returns True when no data."""
-        cache = BNCache()
+        cache = BinanceCache()
         assert cache.is_stale() is True
 
     def test_clear(self):
         """Test clearing cache."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -376,7 +375,7 @@ class TestBNCache:
 
     def test_price_vs_open(self):
         """Test price vs open calculation."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=101000.0,
@@ -389,7 +388,7 @@ class TestBNCache:
 
     def test_p_yes_cents(self):
         """Test p_yes to cents conversion."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -401,7 +400,7 @@ class TestBNCache:
 
     def test_p_yes_cents_clamping(self):
         """Test p_yes cents clamping to 1-99."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -426,7 +425,7 @@ class TestBNSnapshotProperties:
 
     def test_price_vs_open_none_when_no_open(self):
         """Test price_vs_open returns None when no open price."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,
@@ -439,7 +438,7 @@ class TestBNSnapshotProperties:
 
     def test_p_yes_cents_none_when_no_p_yes(self):
         """Test p_yes_cents returns None when no p_yes."""
-        cache = BNCache()
+        cache = BinanceCache()
         cache.update_direct(
             symbol="BTCUSDT",
             best_bid_px=100000.0,

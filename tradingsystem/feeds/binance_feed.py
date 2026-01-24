@@ -1,7 +1,7 @@
 """
-Binance snapshot poller (threaded).
+Binance price feed (threaded).
 
-Polls the binance_pricer HTTP endpoint and updates BNCache.
+Polls the binance_pricer HTTP endpoint and updates BinanceCache.
 Runs in a dedicated thread at configurable Hz.
 """
 
@@ -12,14 +12,14 @@ from typing import Optional
 
 import requests
 
-from .bn_cache import BNCache
+from ..caches import BinanceCache
 
 logger = logging.getLogger(__name__)
 
 
-class BinanceSnapshotPoller:
+class BinanceFeed:
     """
-    Polls Binance pricer HTTP endpoint and updates BNCache.
+    Binance price feed - polls HTTP endpoint and updates BinanceCache.
 
     Runs in a dedicated thread, polling at configurable rate.
     Falls back gracefully when endpoint is unavailable.
@@ -27,16 +27,16 @@ class BinanceSnapshotPoller:
 
     def __init__(
         self,
-        cache: BNCache,
+        cache: BinanceCache,
         url: str = "http://localhost:8080/snapshot/latest",
         poll_hz: int = 20,
         timeout_s: float = 1.0,
     ):
         """
-        Initialize poller.
+        Initialize feed.
 
         Args:
-            cache: BNCache to update
+            cache: BinanceCache to update
             url: URL of binance_pricer endpoint
             poll_hz: Polling frequency (default 20 Hz)
             timeout_s: HTTP request timeout
@@ -56,32 +56,32 @@ class BinanceSnapshotPoller:
         self._last_error: Optional[str] = None
 
     def start(self) -> None:
-        """Start the poller thread."""
+        """Start the feed thread."""
         if self._thread and self._thread.is_alive():
-            logger.warning("BinancePoller already running")
+            logger.warning("BinanceFeed already running")
             return
 
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop,
-            name="Binance-Poller",
+            name="BinanceFeed",
             daemon=True,
         )
         self._thread.start()
-        logger.info(f"BinancePoller started at {1/self._poll_interval:.0f} Hz")
+        logger.info(f"BinanceFeed started at {1/self._poll_interval:.0f} Hz")
 
     def stop(self, timeout: float = 2.0) -> None:
-        """Stop the poller thread."""
-        logger.info("BinancePoller stopping...")
+        """Stop the feed thread."""
+        logger.info("BinanceFeed stopping...")
         self._stop_event.set()
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                logger.warning("BinancePoller did not stop in time")
+                logger.warning("BinanceFeed did not stop in time")
 
         logger.info(
-            f"BinancePoller stopped. Polls={self._poll_count}, "
+            f"BinanceFeed stopped. Polls={self._poll_count}, "
             f"Success={self._success_count}, Errors={self._error_count}"
         )
 
@@ -129,21 +129,21 @@ class BinanceSnapshotPoller:
             self._last_error = "connection_error"
             # Don't spam logs when service is unavailable
             if self._error_count % 100 == 1:
-                logger.debug(f"BinancePoller: connection error to {self._url}")
+                logger.debug(f"BinanceFeed: connection error to {self._url}")
 
         except Exception as e:
             self._error_count += 1
             self._last_error = str(e)
-            logger.debug(f"BinancePoller: {e}")
+            logger.debug(f"BinanceFeed: {e}")
 
     @property
     def is_running(self) -> bool:
-        """Check if poller is running."""
+        """Check if feed is running."""
         return self._thread is not None and self._thread.is_alive()
 
     @property
     def stats(self) -> dict:
-        """Get poller statistics."""
+        """Get feed statistics."""
         return {
             "poll_count": self._poll_count,
             "success_count": self._success_count,

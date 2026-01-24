@@ -1,5 +1,5 @@
 """
-Polymarket User WebSocket Client (threaded).
+Polymarket User Feed (threaded).
 
 Connects to authenticated user WebSocket for order/fill events.
 Pushes events to Executor queue - these events MUST NOT be dropped.
@@ -13,8 +13,8 @@ from typing import Optional, Callable
 
 import orjson
 
-from .ws_base import ThreadedWsClient
-from .mm_types import (
+from .websocket_base import ThreadedWsClient
+from ..mm_types import (
     Token,
     Side,
     OrderStatus,
@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 PM_USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
 
-class PolymarketUserWsClient(ThreadedWsClient):
+class PolymarketUserFeed(ThreadedWsClient):
     """
-    Polymarket user events WebSocket client (authenticated).
+    Polymarket user events feed (authenticated).
 
     Responsibilities:
     - Maintain authenticated connection
@@ -54,7 +54,7 @@ class PolymarketUserWsClient(ThreadedWsClient):
         ping_timeout: int = 60,
     ):
         """
-        Initialize user WebSocket client.
+        Initialize user feed.
 
         Args:
             event_queue: Queue to push events to (Executor inbox)
@@ -68,7 +68,7 @@ class PolymarketUserWsClient(ThreadedWsClient):
         """
         super().__init__(
             ws_url=ws_url,
-            name="PM-User-WS",
+            name="PolymarketUserFeed",
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
         )
@@ -110,11 +110,11 @@ class PolymarketUserWsClient(ThreadedWsClient):
     def _subscribe(self) -> None:
         """Send authenticated subscription message."""
         if not self._api_key or not self._api_secret or not self._passphrase:
-            logger.warning("PM-User-WS: Auth credentials not set, skipping subscribe")
+            logger.warning("PolymarketUserFeed: Auth credentials not set, skipping subscribe")
             return
 
         if not self._market_ids:
-            logger.warning("PM-User-WS: No markets configured, skipping subscribe")
+            logger.warning("PolymarketUserFeed: No markets configured, skipping subscribe")
             return
 
         msg = {
@@ -127,7 +127,7 @@ class PolymarketUserWsClient(ThreadedWsClient):
             "markets": self._market_ids,
         }
         self._send(orjson.dumps(msg))
-        logger.info(f"PM-User-WS: Subscribed to {len(self._market_ids)} markets")
+        logger.info(f"PolymarketUserFeed: Subscribed to {len(self._market_ids)} markets")
 
     def _handle_message(self, data: bytes) -> None:
         """
@@ -147,7 +147,7 @@ class PolymarketUserWsClient(ThreadedWsClient):
 
         except Exception as e:
             # Log errors - we don't want to silently drop user events
-            logger.error(f"PM-User-WS: Parse error: {e}")
+            logger.error(f"PolymarketUserFeed: Parse error: {e}")
 
     def _process_event(self, data: dict) -> None:
         """Process a single event."""
@@ -228,58 +228,54 @@ class PolymarketUserWsClient(ThreadedWsClient):
         if status not in ("CONFIRMED", "MINED", "MATCHED"):
             return
 
-        # Determine if we're taker or maker in this trade
-        trader_side = data.get("trader_side", "")
+        # Process taker fill if we have a taker_order_id
+        taker_order_id = data.get("taker_order_id", "")
+        if taker_order_id:
+            event = FillEvent(
+                event_type=ExecutorEventType.FILL,
+                ts_local_ms=ts,
+                server_order_id=taker_order_id,
+                token=self._outcome_to_token(data.get("outcome")),
+                side=self._parse_side(data.get("side", "")),
+                price=self._price_to_cents(data.get("price")),
+                size=self._parse_size(data.get("size")),
+                fee=0.0,
+                ts_exchange=self._parse_timestamp(data.get("timestamp")),
+            )
+            logger.info(
+                f"[FILL] TAKER: {event.token.name} {event.side.name} "
+                f"{event.size}@{event.price}c order={taker_order_id[:16]}..."
+            )
+            self._enqueue(event)
 
-        # Taker fill - only process if WE are the taker
-        if trader_side == "TAKER":
-            taker_order_id = data.get("taker_order_id", "")
-            if taker_order_id:
-                event = FillEvent(
-                    event_type=ExecutorEventType.FILL,
-                    ts_local_ms=ts,
-                    server_order_id=taker_order_id,
-                    token=self._outcome_to_token(data.get("outcome")),
-                    side=self._parse_side(data.get("side", "")),
-                    price=self._price_to_cents(data.get("price")),
-                    size=self._parse_size(data.get("size")),
-                    fee=0.0,
-                    ts_exchange=self._parse_timestamp(data.get("timestamp")),
-                )
-                logger.info(
-                    f"[FILL] TAKER: {event.token.name} {event.side.name} "
-                    f"{event.size}@{event.price}c order={taker_order_id[:16]}..."
-                )
-                self._enqueue(event)
-
-        # Maker fills - only process if WE are the maker
+        # Process maker fills
         # Note: maker_orders contains ALL makers in this trade, not just us.
         # The executor will filter to only update inventory for orders it tracks.
-        elif trader_side == "MAKER":
-            for maker in data.get("maker_orders", []):
-                maker_order_id = maker.get("order_id", "")
-                if not maker_order_id:
-                    continue
+        for maker in data.get("maker_orders", []):
+            maker_order_id = maker.get("order_id", "")
+            if not maker_order_id:
+                continue
 
-                # Use the side directly from the maker order data (not inverted!)
-                maker_side = self._parse_side(maker.get("side", ""))
+            # Maker side is opposite of trade side
+            trade_side = self._parse_side(data.get("side", ""))
+            maker_side = Side.SELL if trade_side == Side.BUY else Side.BUY
 
-                maker_event = FillEvent(
-                    event_type=ExecutorEventType.FILL,
-                    ts_local_ms=ts,
-                    server_order_id=maker_order_id,
-                    token=self._outcome_to_token(maker.get("outcome")),
-                    side=maker_side,
-                    price=self._price_to_cents(maker.get("price")),
-                    size=self._parse_size(maker.get("matched_amount")),
-                    fee=0.0,
-                    ts_exchange=self._parse_timestamp(data.get("timestamp")),
-                )
-                logger.debug(
-                    f"[FILL] MAKER candidate: {maker_event.token.name} {maker_event.side.name} "
-                    f"{maker_event.size}@{maker_event.price}c order={maker_order_id[:16]}..."
-                )
-                self._enqueue(maker_event)
+            maker_event = FillEvent(
+                event_type=ExecutorEventType.FILL,
+                ts_local_ms=ts,
+                server_order_id=maker_order_id,
+                token=self._outcome_to_token(maker.get("outcome")),
+                side=maker_side,
+                price=self._price_to_cents(maker.get("price")),
+                size=self._parse_size(maker.get("matched_amount")),
+                fee=0.0,
+                ts_exchange=self._parse_timestamp(data.get("timestamp")),
+            )
+            logger.debug(
+                f"[FILL] MAKER candidate: {maker_event.token.name} {maker_event.side.name} "
+                f"{maker_event.size}@{maker_event.price}c order={maker_order_id[:16]}..."
+            )
+            self._enqueue(maker_event)
 
     def _enqueue(self, event) -> None:
         """
@@ -292,16 +288,16 @@ class PolymarketUserWsClient(ThreadedWsClient):
         except queue.Full:
             # This should never happen with properly sized queue
             # Log error and block to ensure event is not dropped
-            logger.error("PM-User-WS: Event queue full! Blocking to enqueue")
+            logger.error("PolymarketUserFeed: Event queue full! Blocking to enqueue")
             self._event_queue.put(event, block=True)
 
     def _on_connect(self) -> None:
         """Called after successful connection."""
         if self._first_connect:
             self._first_connect = False
-            logger.info("PM-User-WS: Initial connection established")
+            logger.info("PolymarketUserFeed: Initial connection established")
         else:
-            logger.info("PM-User-WS: Reconnected")
+            logger.info("PolymarketUserFeed: Reconnected")
 
     def _on_disconnect(self) -> None:
         """
@@ -310,11 +306,11 @@ class PolymarketUserWsClient(ThreadedWsClient):
         CRITICAL: Trigger cancel-all on reconnect for safety.
         """
         if not self._first_connect and self._on_reconnect:
-            logger.warning("PM-User-WS: Disconnect detected, triggering cancel-all")
+            logger.warning("PolymarketUserFeed: Disconnect detected, triggering cancel-all")
             try:
                 self._on_reconnect()
             except Exception as e:
-                logger.error(f"PM-User-WS: Reconnect callback failed: {e}")
+                logger.error(f"PolymarketUserFeed: Reconnect callback failed: {e}")
 
     @staticmethod
     def _parse_side(side_str: str) -> Side:

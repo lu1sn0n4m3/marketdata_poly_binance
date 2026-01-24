@@ -6,10 +6,9 @@ import time
 import threading
 import orjson
 
-from tradingsystem.ws_base import ExponentialBackoff, ThreadedWsClient
-from tradingsystem.pm_market_ws import PolymarketMarketWsClient
-from tradingsystem.pm_user_ws import PolymarketUserWsClient
-from tradingsystem.pm_cache import PMCache
+from tradingsystem.feeds import ExponentialBackoff, ThreadedWsClient
+from tradingsystem.feeds import PolymarketMarketFeed, PolymarketUserFeed
+from tradingsystem.caches import PolymarketCache
 from tradingsystem.mm_types import (
     Token,
     Side,
@@ -60,18 +59,18 @@ class TestExponentialBackoff:
         assert 0.5 <= delay <= 1.0
 
 
-class TestPolymarketMarketWsClient:
-    """Tests for PolymarketMarketWsClient message parsing."""
+class TestPolymarketMarketFeed:
+    """Tests for PolymarketMarketFeed message parsing."""
 
     @pytest.fixture
     def cache(self):
-        """Create fresh PMCache."""
-        return PMCache()
+        """Create fresh PolymarketCache."""
+        return PolymarketCache()
 
     @pytest.fixture
     def client(self, cache):
         """Create market WS client with mock cache."""
-        client = PolymarketMarketWsClient(pm_cache=cache)
+        client = PolymarketMarketFeed(pm_cache=cache)
         client.set_tokens("yes_token_123", "no_token_456", "market_abc")
         return client
 
@@ -200,22 +199,22 @@ class TestPolymarketMarketWsClient:
 
     def test_price_str_to_cents(self):
         """Test price string to cents conversion."""
-        assert PolymarketMarketWsClient._price_str_to_cents("0.50") == 50
-        assert PolymarketMarketWsClient._price_str_to_cents("0.01") == 1
-        assert PolymarketMarketWsClient._price_str_to_cents("0.99") == 99
-        assert PolymarketMarketWsClient._price_str_to_cents(None) == 0
-        assert PolymarketMarketWsClient._price_str_to_cents("") == 0
+        assert PolymarketMarketFeed._price_str_to_cents("0.50") == 50
+        assert PolymarketMarketFeed._price_str_to_cents("0.01") == 1
+        assert PolymarketMarketFeed._price_str_to_cents("0.99") == 99
+        assert PolymarketMarketFeed._price_str_to_cents(None) == 0
+        assert PolymarketMarketFeed._price_str_to_cents("") == 0
 
     def test_parse_level(self):
         """Test price level parsing."""
         level = {"price": "0.55", "size": "150"}
-        px, sz = PolymarketMarketWsClient._parse_level(level)
+        px, sz = PolymarketMarketFeed._parse_level(level)
         assert px == 55
         assert sz == 150
 
 
-class TestPolymarketUserWsClient:
-    """Tests for PolymarketUserWsClient message parsing."""
+class TestPolymarketUserFeed:
+    """Tests for PolymarketUserFeed message parsing."""
 
     @pytest.fixture
     def event_queue(self):
@@ -233,7 +232,7 @@ class TestPolymarketUserWsClient:
         def on_reconnect():
             reconnect_flag["called"] = True
 
-        client = PolymarketUserWsClient(
+        client = PolymarketUserFeed(
             event_queue=event_queue,
             api_key="test_key",
             api_secret="test_secret",
@@ -400,7 +399,7 @@ class TestPolymarketUserWsClient:
     def test_enqueue_blocks_on_full_queue(self, event_queue):
         """Test that enqueue blocks when queue is full."""
         small_queue = queue.Queue(maxsize=1)
-        client = PolymarketUserWsClient(
+        client = PolymarketUserFeed(
             event_queue=small_queue,
             api_key="key",
             api_secret="secret",
@@ -456,19 +455,19 @@ class TestPolymarketUserWsClient:
 
     def test_outcome_to_token(self):
         """Test outcome string to Token conversion."""
-        assert PolymarketUserWsClient._outcome_to_token("Yes") == Token.YES
-        assert PolymarketUserWsClient._outcome_to_token("yes") == Token.YES
-        assert PolymarketUserWsClient._outcome_to_token("Up") == Token.YES
-        assert PolymarketUserWsClient._outcome_to_token("No") == Token.NO
-        assert PolymarketUserWsClient._outcome_to_token("Down") == Token.NO
-        assert PolymarketUserWsClient._outcome_to_token(None) == Token.NO
+        assert PolymarketUserFeed._outcome_to_token("Yes") == Token.YES
+        assert PolymarketUserFeed._outcome_to_token("yes") == Token.YES
+        assert PolymarketUserFeed._outcome_to_token("Up") == Token.YES
+        assert PolymarketUserFeed._outcome_to_token("No") == Token.NO
+        assert PolymarketUserFeed._outcome_to_token("Down") == Token.NO
+        assert PolymarketUserFeed._outcome_to_token(None) == Token.NO
 
     def test_parse_side(self):
         """Test side string parsing."""
-        assert PolymarketUserWsClient._parse_side("BUY") == Side.BUY
-        assert PolymarketUserWsClient._parse_side("buy") == Side.BUY
-        assert PolymarketUserWsClient._parse_side("SELL") == Side.SELL
-        assert PolymarketUserWsClient._parse_side("anything") == Side.SELL
+        assert PolymarketUserFeed._parse_side("BUY") == Side.BUY
+        assert PolymarketUserFeed._parse_side("buy") == Side.BUY
+        assert PolymarketUserFeed._parse_side("SELL") == Side.SELL
+        assert PolymarketUserFeed._parse_side("anything") == Side.SELL
 
     def test_on_disconnect_triggers_callback(self, client, reconnect_flag):
         """Test that disconnect triggers reconnect callback."""
@@ -492,8 +491,8 @@ class TestSubscriptionMessages:
 
     def test_market_ws_subscription_format(self):
         """Test market WS subscription message format."""
-        cache = PMCache()
-        client = PolymarketMarketWsClient(pm_cache=cache)
+        cache = PolymarketCache()
+        client = PolymarketMarketFeed(pm_cache=cache)
         client.set_tokens("yes_abc", "no_xyz", "market_123")
 
         # Can't easily test _subscribe without connection, but we can verify config
@@ -503,7 +502,7 @@ class TestSubscriptionMessages:
     def test_user_ws_subscription_format(self):
         """Test user WS subscription message format."""
         q = queue.Queue()
-        client = PolymarketUserWsClient(
+        client = PolymarketUserFeed(
             event_queue=q,
             api_key="key123",
             api_secret="secret456",

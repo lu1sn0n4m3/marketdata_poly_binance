@@ -1,8 +1,8 @@
 """
-Polymarket Market WebSocket Client (threaded).
+Polymarket Market Feed (threaded).
 
 Connects to public market WebSocket for order book updates.
-Updates PMCache with latest BBO data.
+Updates PolymarketCache with latest BBO data.
 
 WS handlers are kept minimal and fast per design doc guidelines.
 """
@@ -12,9 +12,9 @@ from typing import Optional
 
 import orjson
 
-from .ws_base import ThreadedWsClient
-from .pm_cache import PMCache
-from .mm_types import price_to_cents
+from .websocket_base import ThreadedWsClient
+from ..caches import PolymarketCache
+from ..mm_types import price_to_cents
 
 logger = logging.getLogger(__name__)
 
@@ -22,27 +22,27 @@ logger = logging.getLogger(__name__)
 PM_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
-class PolymarketMarketWsClient(ThreadedWsClient):
+class PolymarketMarketFeed(ThreadedWsClient):
     """
-    Polymarket market data WebSocket client.
+    Polymarket market data feed.
 
     Responsibilities:
     - Maintain connection with exponential backoff reconnection
     - Subscribe to YES and NO token order books
-    - Parse messages minimally and update PMCache
+    - Parse messages minimally and update PolymarketCache
     - NO heavy computation in message handlers
     """
 
     def __init__(
         self,
-        pm_cache: PMCache,
+        pm_cache: PolymarketCache,
         ws_url: str = PM_MARKET_WS_URL,
         ping_interval: int = 20,
         ping_timeout: int = 60,
     ):
         super().__init__(
             ws_url=ws_url,
-            name="PM-Market-WS",
+            name="PolymarketMarketFeed",
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
         )
@@ -81,7 +81,7 @@ class PolymarketMarketWsClient(ThreadedWsClient):
     def _subscribe(self) -> None:
         """Send subscription message."""
         if not self._yes_token_id:
-            logger.warning("PM-Market-WS: No tokens configured, skipping subscribe")
+            logger.warning("PolymarketMarketFeed: No tokens configured, skipping subscribe")
             return
 
         msg = {
@@ -90,7 +90,7 @@ class PolymarketMarketWsClient(ThreadedWsClient):
             "custom_feature_enabled": False,
         }
         self._send(orjson.dumps(msg))
-        logger.info(f"PM-Market-WS: Subscribed to {self._market_id[:20]}...")
+        logger.info(f"PolymarketMarketFeed: Subscribed to {self._market_id[:20]}...")
 
     def _handle_message(self, data: bytes) -> None:
         """
@@ -110,7 +110,7 @@ class PolymarketMarketWsClient(ThreadedWsClient):
 
         except Exception as e:
             # Minimal logging - avoid string formatting in hot path
-            logger.debug(f"PM-Market-WS: Parse error: {e}")
+            logger.debug(f"PolymarketMarketFeed: Parse error: {e}")
 
     def _process_event(self, data: dict) -> None:
         """Process a single event."""
@@ -179,7 +179,7 @@ class PolymarketMarketWsClient(ThreadedWsClient):
         self._publish_to_cache()
 
     def _publish_to_cache(self) -> None:
-        """Publish current state to PMCache."""
+        """Publish current state to PolymarketCache."""
         self._cache.update_from_ws(
             yes_bbo=self._yes_bbo,
             no_bbo=self._no_bbo,
@@ -212,7 +212,7 @@ class PolymarketMarketWsClient(ThreadedWsClient):
 
     def _on_connect(self) -> None:
         """Called after connection established."""
-        logger.info(f"PM-Market-WS: Ready, monitoring {self._market_id[:30]}...")
+        logger.info(f"PolymarketMarketFeed: Ready, monitoring {self._market_id[:30]}...")
 
     def _on_disconnect(self) -> None:
         """Called after disconnection."""

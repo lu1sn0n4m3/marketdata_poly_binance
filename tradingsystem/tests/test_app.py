@@ -7,8 +7,8 @@ import pytest
 from unittest.mock import Mock, MagicMock, patch
 
 from tradingsystem.config import AppConfig
-from tradingsystem.bn_poller import BinanceSnapshotPoller
-from tradingsystem.bn_cache import BNCache
+from tradingsystem.feeds import BinanceFeed
+from tradingsystem.caches import BinanceCache
 from tradingsystem.mm_types import MarketInfo
 
 
@@ -62,17 +62,17 @@ class TestAppConfig:
         assert len(errors) == 0
 
 
-class TestBinanceSnapshotPoller:
-    """Tests for BinanceSnapshotPoller."""
+class TestBinanceFeed:
+    """Tests for BinanceFeed."""
 
     @pytest.fixture
     def cache(self):
-        """Create BN cache."""
-        return BNCache()
+        """Create Binance cache."""
+        return BinanceCache()
 
     def test_poller_starts_and_stops(self, cache):
         """Test poller lifecycle."""
-        poller = BinanceSnapshotPoller(
+        poller = BinanceFeed(
             cache=cache,
             url="http://localhost:9999/nonexistent",
             poll_hz=10,
@@ -87,7 +87,7 @@ class TestBinanceSnapshotPoller:
 
     def test_poller_handles_connection_errors(self, cache):
         """Test poller handles connection errors gracefully."""
-        poller = BinanceSnapshotPoller(
+        poller = BinanceFeed(
             cache=cache,
             url="http://localhost:9999/nonexistent",
             poll_hz=100,  # Fast polling
@@ -103,7 +103,7 @@ class TestBinanceSnapshotPoller:
         assert stats["error_count"] > 0
         assert stats["last_error"] == "connection_error"
 
-    @patch("tradingsystem.bn_poller.requests.get")
+    @patch("tradingsystem.feeds.binance_feed.requests.get")
     def test_poller_updates_cache_on_success(self, mock_get, cache):
         """Test poller updates cache on successful response."""
         mock_response = Mock()
@@ -117,7 +117,7 @@ class TestBinanceSnapshotPoller:
         }
         mock_get.return_value = mock_response
 
-        poller = BinanceSnapshotPoller(
+        poller = BinanceFeed(
             cache=cache,
             url="http://localhost:8080/snapshot",
             poll_hz=10,
@@ -136,7 +136,7 @@ class TestBinanceSnapshotPoller:
 
     def test_poller_stats(self, cache):
         """Test poller stats tracking."""
-        poller = BinanceSnapshotPoller(
+        poller = BinanceFeed(
             cache=cache,
             url="http://localhost:9999/nonexistent",
             poll_hz=50,
@@ -158,13 +158,12 @@ class TestMMApplicationComponents:
 
     def test_strategy_input_construction(self):
         """Test strategy input is built correctly from caches."""
-        from tradingsystem.pm_cache import PMCache
-        from tradingsystem.bn_cache import BNCache
+        from tradingsystem.caches import PolymarketCache, BinanceCache
         from tradingsystem.mm_types import InventoryState
         from tradingsystem.strategy import StrategyInput
 
-        pm_cache = PMCache()
-        bn_cache = BNCache()
+        pm_cache = PolymarketCache()
+        bn_cache = BinanceCache()
 
         # Empty caches
         pm_book, pm_seq = pm_cache.get_latest()

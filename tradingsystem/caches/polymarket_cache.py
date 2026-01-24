@@ -11,8 +11,8 @@ import time
 from collections import deque
 from typing import Optional
 
-from .snapshot_store import LatestSnapshotStore
-from .mm_types import (
+from ..snapshot_store import LatestSnapshotStore
+from ..mm_types import (
     MarketSnapshotMeta,
     PMBookTop,
     PMBookSnapshot,
@@ -21,7 +21,7 @@ from .mm_types import (
 )
 
 
-class PMCache:
+class PolymarketCache:
     """
     Polymarket order book snapshot cache.
 
@@ -36,7 +36,7 @@ class PMCache:
 
     def __init__(self, history_size: int = 100):
         """
-        Initialize PMCache.
+        Initialize PolymarketCache.
 
         Args:
             history_size: Number of historical mid prices to retain

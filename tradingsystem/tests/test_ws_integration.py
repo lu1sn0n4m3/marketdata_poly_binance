@@ -27,9 +27,8 @@ sys.path.insert(0, str(project_root))
 
 import json
 
-from tradingsystem.pm_cache import PMCache
-from tradingsystem.pm_market_ws import PolymarketMarketWsClient
-from tradingsystem.pm_user_ws import PolymarketUserWsClient
+from tradingsystem.caches import PolymarketCache
+from tradingsystem.feeds import PolymarketMarketFeed, PolymarketUserFeed
 from tradingsystem.market_finder import build_market_slug, get_current_hour_et
 from tradingsystem.gamma_client import GammaClient
 
@@ -98,8 +97,8 @@ class TestMarketWsIntegration:
     @pytest.mark.integration
     def test_market_ws_connects_and_receives_data(self):
         """Test real connection to market WebSocket."""
-        cache = PMCache()
-        client = PolymarketMarketWsClient(pm_cache=cache)
+        cache = PolymarketCache()
+        client = PolymarketMarketFeed(pm_cache=cache)
 
         # Get current market info (slug uses start hour)
         start_time = get_current_hour_et()
@@ -217,7 +216,7 @@ class TestUserWsIntegration:
             reconnect_called["value"] = True
             logger.info("Reconnect callback triggered")
 
-        client = PolymarketUserWsClient(
+        client = PolymarketUserFeed(
             event_queue=event_queue,
             api_key=creds["api_key"],
             api_secret=creds["api_secret"],
@@ -281,10 +280,10 @@ class TestBinanceIntegration:
 
     @pytest.mark.integration
     def test_binance_snapshot_polling(self):
-        """Test fetching Binance snapshot (simulated from bn_cache)."""
-        from tradingsystem.bn_cache import BNCache
+        """Test fetching Binance snapshot (simulated with BinanceCache)."""
+        from tradingsystem.caches import BinanceCache
 
-        cache = BNCache()
+        cache = BinanceCache()
 
         # Simulate a polled response (in real app, this comes from binance_pricer service)
         mock_response = {

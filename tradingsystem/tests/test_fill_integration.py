@@ -25,7 +25,7 @@ from tradingsystem.gamma_client import GammaClient
 from tradingsystem.market_finder import BitcoinHourlyMarketFinder, get_current_hour_et
 from tradingsystem.pm_rest_client import PolymarketRestClient
 from tradingsystem.gateway import Gateway
-from tradingsystem.pm_user_ws import PolymarketUserWsClient
+from tradingsystem.feeds import PolymarketUserFeed
 
 
 def load_credentials():
@@ -116,7 +116,7 @@ def main():
 
     # Setup User WebSocket for fill notifications
     print("\n--- Setting up User WebSocket ---")
-    user_ws = PolymarketUserWsClient(
+    user_ws = PolymarketUserFeed(
         event_queue=event_queue,
         api_key=api_key,
         api_secret=api_secret,

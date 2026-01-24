@@ -5,9 +5,9 @@ Wires all components together and manages application lifecycle.
 Uses threading for all components (no asyncio in main loop).
 
 Component threading layout:
-- Thread 1: PM Market WS → PMCache
+- Thread 1: PM Market WS → PolymarketCache
 - Thread 2: PM User WS → Executor event queue
-- Thread 3: Binance Poller → BNCache
+- Thread 3: Binance Poller → BinanceCache
 - Thread 4: Strategy Runner → Intent Mailbox
 - Thread 5: Executor Actor → Gateway
 - Thread 6: Gateway Worker
@@ -27,10 +27,8 @@ from .mm_types import (
     MarketInfo,
     now_ms,
 )
-from .pm_cache import PMCache
-from .bn_cache import BNCache
-from .pm_market_ws import PolymarketMarketWsClient
-from .pm_user_ws import PolymarketUserWsClient
+from .caches import PolymarketCache, BinanceCache
+from .feeds import PolymarketMarketFeed, PolymarketUserFeed, BinanceFeed
 from .pm_rest_client import PolymarketRestClient
 from .gateway import Gateway
 from .strategy import (
@@ -42,7 +40,6 @@ from .strategy import (
     IntentMailbox,
 )
 from .executor import ExecutorActor
-from .bn_poller import BinanceSnapshotPoller
 from .gamma_client import GammaClient
 from .market_finder import BitcoinHourlyMarketFinder
 
@@ -75,12 +72,12 @@ class MMApplication:
         self._custom_strategy = strategy
 
         # Components (initialized in _setup_components)
-        self._pm_cache: Optional[PMCache] = None
-        self._bn_cache: Optional[BNCache] = None
+        self._pm_cache: Optional[PolymarketCache] = None
+        self._bn_cache: Optional[BinanceCache] = None
 
-        self._pm_market_ws: Optional[PolymarketMarketWsClient] = None
-        self._pm_user_ws: Optional[PolymarketUserWsClient] = None
-        self._bn_poller: Optional[BinanceSnapshotPoller] = None
+        self._pm_market_ws: Optional[PolymarketMarketFeed] = None
+        self._pm_user_ws: Optional[PolymarketUserFeed] = None
+        self._bn_poller: Optional[BinanceFeed] = None
 
         self._rest_client: Optional[PolymarketRestClient] = None
         self._gateway: Optional[Gateway] = None
@@ -105,8 +102,8 @@ class MMApplication:
         cfg = self._config
 
         # Caches
-        self._pm_cache = PMCache()
-        self._bn_cache = BNCache()
+        self._pm_cache = PolymarketCache()
+        self._bn_cache = BinanceCache()
 
         # Event queue for executor (fills, acks from User WS)
         self._event_queue = queue.Queue(maxsize=1000)
@@ -134,15 +131,15 @@ class MMApplication:
         self._gamma = GammaClient()
         self._market_finder = BitcoinHourlyMarketFinder(self._gamma)
 
-        # Market WS (feeds PMCache)
-        self._pm_market_ws = PolymarketMarketWsClient(
+        # Market WS (feeds PolymarketCache)
+        self._pm_market_ws = PolymarketMarketFeed(
             pm_cache=self._pm_cache,
             ws_url=cfg.pm_ws_market_url,
         )
 
         # User WS (feeds event queue for fills/acks)
         api_key, api_secret, passphrase = self._rest_client.api_credentials
-        self._pm_user_ws = PolymarketUserWsClient(
+        self._pm_user_ws = PolymarketUserFeed(
             event_queue=self._event_queue,
             api_key=api_key,
             api_secret=api_secret,
@@ -153,7 +150,7 @@ class MMApplication:
 
         # Binance poller (only if URL provided)
         if cfg.binance_snapshot_url:
-            self._bn_poller = BinanceSnapshotPoller(
+            self._bn_poller = BinanceFeed(
                 cache=self._bn_cache,
                 url=cfg.binance_snapshot_url,
                 poll_hz=cfg.binance_poll_hz,
