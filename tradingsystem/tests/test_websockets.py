@@ -106,20 +106,24 @@ class TestPolymarketMarketFeed:
         assert snapshot.yes_top.best_ask_px == 52
         assert snapshot.yes_top.best_ask_sz == 200
 
-    def test_handle_book_no(self, client, cache):
-        """Test handling book snapshot for NO token."""
+    def test_handle_book_no_derived_from_yes(self, client, cache):
+        """Test that NO BBO is derived from YES book (NO book messages are ignored)."""
+        # Send YES book - NO will be derived from it
         msg = {
             "event_type": "book",
-            "asset_id": "no_token_456",
-            "bids": [{"price": "0.45", "size": "80"}],
-            "asks": [{"price": "0.48", "size": "120"}],
+            "asset_id": "yes_token_123",
+            "bids": [{"price": "0.50", "size": "100"}],  # YES bid 50
+            "asks": [{"price": "0.52", "size": "200"}],  # YES ask 52
         }
         client._handle_message(orjson.dumps(msg))
 
         snapshot, _ = cache.get_latest()
         assert snapshot is not None
-        assert snapshot.no_top.best_bid_px == 45
-        assert snapshot.no_top.best_ask_px == 48
+        # NO is derived: NO bid = 100 - YES ask, NO ask = 100 - YES bid
+        assert snapshot.no_top.best_bid_px == 48   # 100 - 52
+        assert snapshot.no_top.best_ask_px == 50   # 100 - 50
+        assert snapshot.no_top.best_bid_sz == 200  # Same as YES ask size
+        assert snapshot.no_top.best_ask_sz == 100  # Same as YES bid size
 
     def test_handle_price_change(self, client, cache):
         """Test handling price change event."""
@@ -162,7 +166,7 @@ class TestPolymarketMarketFeed:
         assert snapshot.yes_top.best_ask_px == 57
 
     def test_handle_array_of_events(self, client, cache):
-        """Test handling array of events."""
+        """Test handling array of events (only YES is processed, NO is derived)."""
         msgs = [
             {
                 "event_type": "best_bid_ask",
@@ -172,7 +176,7 @@ class TestPolymarketMarketFeed:
             },
             {
                 "event_type": "best_bid_ask",
-                "asset_id": "no_token_456",
+                "asset_id": "no_token_456",  # This is ignored - NO is derived
                 "best_bid": "0.48",
                 "best_ask": "0.50",
             },
@@ -180,9 +184,12 @@ class TestPolymarketMarketFeed:
         client._handle_message(orjson.dumps(msgs))
 
         snapshot, seq = cache.get_latest()
-        assert seq == 2  # Two updates
+        assert seq == 1  # Only YES update is processed
         assert snapshot.yes_top.best_bid_px == 50
-        assert snapshot.no_top.best_bid_px == 48
+        assert snapshot.yes_top.best_ask_px == 52
+        # NO is derived from YES: NO bid = 100 - YES ask, NO ask = 100 - YES bid
+        assert snapshot.no_top.best_bid_px == 48  # 100 - 52
+        assert snapshot.no_top.best_ask_px == 50  # 100 - 50
 
     def test_ignore_unknown_asset(self, client, cache):
         """Test that unknown asset IDs are ignored."""
@@ -194,11 +201,10 @@ class TestPolymarketMarketFeed:
         }
         client._handle_message(orjson.dumps(msg))
 
-        # Cache should be updated but with default values since unknown token
-        snapshot, _ = cache.get_latest()
-        # Default YES values unchanged
-        assert snapshot.yes_top.best_bid_px == 0
-        assert snapshot.yes_top.best_ask_px == 100
+        # Unknown token is ignored - nothing published to cache
+        snapshot, seq = cache.get_latest()
+        assert snapshot is None  # No updates published
+        assert seq == 0
 
     def test_price_str_to_cents(self):
         """Test price string to cents conversion."""

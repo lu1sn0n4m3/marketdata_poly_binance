@@ -102,7 +102,13 @@ class GatewayWorker:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._last_action_ts: int = 0
+
+        # Token bucket rate limiting (allows bursts, reduces latency)
+        # Capacity = max burst size, refill_rate = tokens per ms
+        self._bucket_capacity = 5  # Allow up to 5 orders in quick succession
+        self._bucket_tokens = float(self._bucket_capacity)  # Start full
+        self._bucket_last_refill = now_ms()
+        self._bucket_refill_rate = 1.0 / min_action_interval_ms  # tokens per ms
 
         self.stats = GatewayStats()
 
@@ -179,15 +185,36 @@ class GatewayWorker:
         logger.info("GatewayWorker run loop exited")
 
     def _apply_rate_limit(self) -> None:
-        """Apply rate limiting between actions."""
+        """
+        Apply token bucket rate limiting between actions.
+
+        Allows bursts of up to _bucket_capacity actions with no delay,
+        then limits to 1 action per _min_interval_ms.
+
+        This is better than fixed delay because:
+        - If idle, first N actions are instant (no latency penalty)
+        - Only slows down when sustained high rate
+        """
         now = now_ms()
-        elapsed = now - self._last_action_ts
 
-        if elapsed < self._min_interval_ms:
-            sleep_ms = self._min_interval_ms - elapsed
-            time.sleep(sleep_ms / 1000)
+        # Refill tokens based on time elapsed
+        elapsed = now - self._bucket_last_refill
+        self._bucket_tokens = min(
+            self._bucket_capacity,
+            self._bucket_tokens + elapsed * self._bucket_refill_rate
+        )
+        self._bucket_last_refill = now
 
-        self._last_action_ts = now_ms()
+        # If we have a token, use it immediately (no sleep!)
+        if self._bucket_tokens >= 1.0:
+            self._bucket_tokens -= 1.0
+            return
+
+        # No tokens - wait for next token to be available
+        wait_ms = (1.0 - self._bucket_tokens) / self._bucket_refill_rate
+        time.sleep(wait_ms / 1000)
+        self._bucket_tokens = 0.0
+        self._bucket_last_refill = now_ms()
 
     def _process_action(self, action: GatewayAction) -> GatewayResult:
         """Process a single gateway action."""
@@ -235,7 +262,8 @@ class GatewayWorker:
         )
         latency_ms = now_ms() - t0
         order_id_short = result.order_id[:16] if result.order_id else "none"
-        logger.info(f"[LATENCY] http_place: {latency_ms}ms order={order_id_short}... {'OK' if result.success else 'FAIL'}")
+        # DEBUG level to avoid hot path latency (was INFO)
+        logger.debug(f"[LATENCY] http_place: {latency_ms}ms order={order_id_short}... {'OK' if result.success else 'FAIL'}")
 
         return GatewayResult(
             action_id=action.action_id,
@@ -258,7 +286,8 @@ class GatewayWorker:
         t0 = now_ms()
         result = self._rest.cancel_order(order_id)
         latency_ms = now_ms() - t0
-        logger.info(f"[LATENCY] http_cancel: {latency_ms}ms order={order_id[:16]}... {'OK' if result.success else 'FAIL'}")
+        # DEBUG level to avoid hot path latency (was INFO)
+        logger.debug(f"[LATENCY] http_cancel: {latency_ms}ms order={order_id[:16]}... {'OK' if result.success else 'FAIL'}")
 
         return GatewayResult(
             action_id=action.action_id,

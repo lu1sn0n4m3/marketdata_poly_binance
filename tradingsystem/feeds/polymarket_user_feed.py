@@ -316,6 +316,8 @@ class PolymarketUserFeed(ThreadedWsClient):
         trader_side = data.get("trader_side", "")  # "TAKER" or "MAKER"
 
         # DEBUG: Save raw trade event to file for analysis
+        # NOTE: Removed flush() - was causing 10-100ms latency per fill
+        # File will flush automatically on buffer full or program exit
         if self._debug_trade_file:
             debug_entry = {
                 "local_ts": ts,
@@ -323,18 +325,18 @@ class PolymarketUserFeed(ThreadedWsClient):
                 "raw": data,
             }
             self._debug_trade_file.write(orjson.dumps(debug_entry).decode() + "\n")
-            self._debug_trade_file.flush()
+            # self._debug_trade_file.flush()  # REMOVED: 10-100ms latency killer
 
-        # DEBUG: Log raw trade event data
-        logger.info(f"[TRADE_DEBUG] Raw trade event: status={status} trader_side={trader_side} outcome={data.get('outcome')} side={data.get('side')} size={data.get('size')} price={data.get('price')}")
+        # DEBUG: Log raw trade event data (DEBUG level to avoid hot path latency)
+        logger.debug(f"[TRADE_DEBUG] Raw trade event: status={status} trader_side={trader_side} outcome={data.get('outcome')} side={data.get('side')} size={data.get('size')} price={data.get('price')}")
 
         # Determine if this is a pending (MATCHED) or settled (MINED/CONFIRMED) fill
         if status == "MATCHED":
             is_pending = True
-            logger.info(f"[FILL] Processing MATCHED fill (pending): trade_id={trade_id[:20]}...")
+            logger.debug(f"[FILL] Processing MATCHED fill (pending): trade_id={trade_id[:20]}...")
         elif status in ("CONFIRMED", "MINED"):
             is_pending = False
-            logger.info(f"[FILL] Processing {status} fill (settled): trade_id={trade_id[:20]}...")
+            logger.debug(f"[FILL] Processing {status} fill (settled): trade_id={trade_id[:20]}...")
         else:
             # Unknown status - ignore
             logger.debug(f"[FILL] Ignoring unknown fill status: status={status}")

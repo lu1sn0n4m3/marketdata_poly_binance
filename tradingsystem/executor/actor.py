@@ -290,21 +290,21 @@ class ExecutorActor:
                 f"(residual: {report.bid_residual}/{report.ask_residual})"
             )
 
-        # Debug: log planned orders and their prices
+        # Debug: log planned orders and their prices (DEBUG to avoid hot path latency)
         for order in plan.bid.orders:
-            logger.info(
+            logger.debug(
                 f"[PLAN] bid: {order.token.name} {order.side.name} {order.sz}@{order.px}c kind={order.kind.name}"
             )
         for order in plan.ask.orders:
-            logger.info(
+            logger.debug(
                 f"[PLAN] ask: {order.token.name} {order.side.name} {order.sz}@{order.px}c kind={order.kind.name}"
             )
 
-        # Log latency from book update to reconcile
+        # Log latency from book update to reconcile (DEBUG to avoid hot path latency)
         if intent.book_ts > 0:
             from ..types import now_ms
             latency_ms = now_ms() - intent.book_ts
-            logger.info(f"[LATENCY] book_to_plan: {latency_ms}ms (seq={intent.pm_seq})")
+            logger.debug(f"[LATENCY] book_to_plan: {latency_ms}ms (seq={intent.pm_seq})")
 
         # Reconcile each slot
         self._reconcile_slot(state.bid_slot, plan.bid, ts)
