@@ -82,16 +82,19 @@ class TestPolymarketMarketFeed:
 
     def test_handle_book_yes(self, client, cache):
         """Test handling book snapshot for YES token."""
+        # Polymarket order book sorting:
+        # BIDS: sorted ascending (0.01, 0.02, ...), best bid (highest) is LAST
+        # ASKS: sorted descending (0.99, 0.98, ...), best ask (lowest) is LAST
         msg = {
             "event_type": "book",
             "asset_id": "yes_token_123",
             "bids": [
                 {"price": "0.48", "size": "50"},
-                {"price": "0.50", "size": "100"},  # Best bid (last)
+                {"price": "0.50", "size": "100"},  # Best bid (highest, last)
             ],
             "asks": [
-                {"price": "0.52", "size": "200"},  # Best ask (first)
-                {"price": "0.54", "size": "150"},
+                {"price": "0.54", "size": "150"},  # Higher price first
+                {"price": "0.52", "size": "200"},  # Best ask (lowest, last)
             ],
         }
         client._handle_message(orjson.dumps(msg))
@@ -237,6 +240,7 @@ class TestPolymarketUserFeed:
             api_key="test_key",
             api_secret="test_secret",
             passphrase="test_pass",
+            maker_address="0xOurWalletAddress",  # Our wallet address for MAKER fill matching
             on_reconnect=on_reconnect,
         )
         client.set_markets(["market_123"])
@@ -329,7 +333,9 @@ class TestPolymarketUserFeed:
         """Test handling trade fill event as taker."""
         msg = {
             "event_type": "trade",
+            "id": "trade_abc123",  # Unique trade ID for deduplication
             "status": "CONFIRMED",
+            "trader_side": "TAKER",  # We are the taker
             "taker_order_id": "order_456",
             "price": "0.55",
             "size": "50",
@@ -347,41 +353,61 @@ class TestPolymarketUserFeed:
         assert event.size == 50
         assert event.side == Side.BUY
         assert event.token == Token.YES
+        assert event.trade_id == "trade_abc123"
+        assert event.role == "TAKER"
+        assert event.fill_id == "SETTLED:TAKER:trade_abc123"
 
     def test_handle_trade_event_maker(self, client, event_queue):
-        """Test handling trade fill event with maker orders."""
+        """Test handling trade fill event as maker."""
+        # When trader_side=MAKER, we are the maker, not the taker
+        # Only our orders (matching maker_address) should generate fills
         msg = {
             "event_type": "trade",
+            "id": "trade_xyz789",  # Unique trade ID for deduplication
             "status": "MINED",
-            "taker_order_id": "taker_123",
+            "trader_side": "MAKER",  # We are a maker in this trade
+            "taker_order_id": "taker_123",  # Someone else's order
             "price": "0.55",
             "size": "50",
             "side": "BUY",
             "outcome": "Yes",
             "timestamp": "1700000000000",
-            "maker_orders": [{
-                "order_id": "maker_456",
-                "price": "0.55",
-                "matched_amount": "50",
-                "outcome": "Yes",
-            }],
+            "maker_orders": [
+                {
+                    "order_id": "maker_456",
+                    "owner": "some_uuid",
+                    "maker_address": "0xOurWalletAddress",  # Our order (matches our wallet)
+                    "price": "0.55",
+                    "matched_amount": "50",
+                    "outcome": "Yes",
+                    "side": "SELL",  # Maker's original order side
+                },
+                {
+                    "order_id": "other_maker_789",
+                    "owner": "someone_else",
+                    "maker_address": "0xSomeoneElseWallet",  # Not our order
+                    "price": "0.55",
+                    "matched_amount": "30",
+                    "outcome": "Yes",
+                    "side": "SELL",
+                },
+            ],
         }
         client._handle_message(orjson.dumps(msg))
 
-        # Should get two events: taker and maker
+        # Should only get ONE event: our maker fill (not taker, not other makers)
         events = []
         while not event_queue.empty():
             events.append(event_queue.get_nowait())
 
-        assert len(events) == 2
+        assert len(events) == 1
 
-        taker_event = events[0]
-        assert taker_event.server_order_id == "taker_123"
-        assert taker_event.side == Side.BUY
-
-        maker_event = events[1]
+        maker_event = events[0]
         assert maker_event.server_order_id == "maker_456"
-        assert maker_event.side == Side.SELL  # Opposite of trade side
+        assert maker_event.side == Side.SELL  # Maker's side from the data
+        assert maker_event.trade_id == "trade_xyz789"
+        assert maker_event.role == "MAKER"
+        assert maker_event.fill_id == "SETTLED:MAKER:trade_xyz789:maker_456"
 
     def test_ignore_unconfirmed_trade(self, client, event_queue):
         """Test that unconfirmed trades are ignored."""

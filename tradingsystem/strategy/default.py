@@ -170,9 +170,15 @@ class DefaultMMStrategy(Strategy):
         Skew pushes quotes in the direction that would reduce inventory.
         If long, skew is positive -> quotes move down -> more likely to sell.
         If short, skew is negative -> quotes move up -> more likely to buy.
+
+        IMPORTANT: Uses EFFECTIVE inventory (settled + pending) so that
+        pending fills from MATCHED orders are considered. This prevents
+        duplicate bids while fills are being mined on the blockchain.
         """
         cfg = self.config
-        net_pos = inp.inventory.net_E
+        # Use effective_net_E to include pending inventory
+        # This prevents placing duplicate bids after MATCHED but before MINED
+        net_pos = inp.inventory.effective_net_E
 
         # Skew per share of net position
         skew = int(net_pos * cfg.skew_per_share_cents)
@@ -188,6 +194,10 @@ class DefaultMMStrategy(Strategy):
         - Base size from config
         - Time to expiry (smaller near expiry)
         - Position (reduce size on side that would increase exposure)
+
+        IMPORTANT: Uses EFFECTIVE inventory (settled + pending) so that
+        pending fills are considered. This prevents oversized bids
+        while fills are being mined on the blockchain.
         """
         cfg = self.config
         base = cfg.base_size
@@ -197,16 +207,17 @@ class DefaultMMStrategy(Strategy):
             base = int(base * cfg.expiry_size_reduction)
 
         # Position-based size adjustment
-        net_pos = inp.inventory.net_E
+        # Use effective_net_E to include pending inventory
+        net_pos = inp.inventory.effective_net_E
 
-        # Reduce bid size if already long
+        # Reduce bid size if already long (including pending)
         if net_pos > 0:
             bid_reduction = min(1.0, net_pos / cfg.max_position)
             bid_sz = int(base * (1 - bid_reduction * 0.5))
         else:
             bid_sz = base
 
-        # Reduce ask size if already short
+        # Reduce ask size if already short (including pending)
         if net_pos < 0:
             ask_reduction = min(1.0, -net_pos / cfg.max_position)
             ask_sz = int(base * (1 - ask_reduction * 0.5))
@@ -224,15 +235,20 @@ class DefaultMMStrategy(Strategy):
         Determine quoting mode based on conditions.
 
         At max position, goes one-sided to avoid increasing exposure.
+
+        IMPORTANT: Uses EFFECTIVE inventory (settled + pending) so that
+        pending fills are considered. This prevents exceeding max position
+        while fills are being mined on the blockchain.
         """
         cfg = self.config
-        net_pos = inp.inventory.net_E
+        # Use effective_net_E to include pending inventory
+        net_pos = inp.inventory.effective_net_E
 
-        # At max long position - only sell
+        # At max long position (including pending) - only sell
         if net_pos >= cfg.max_position:
             return QuoteMode.ONE_SIDED_SELL
 
-        # At max short position - only buy
+        # At max short position (including pending) - only buy
         if net_pos <= -cfg.max_position:
             return QuoteMode.ONE_SIDED_BUY
 

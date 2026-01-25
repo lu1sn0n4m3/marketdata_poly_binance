@@ -1,2 +1,0 @@
-{"ts": 326364537, "time": "1970-01-04T18:39:24.537000", "token": "YES", "side": "BUY", "size": 10, "price_cents": 50, "value_usd": 5.0, "order_id": "order_1", "realized_pnl_cents": 0, "realized_pnl_usd": 0.0, "inventory": {"yes": 10, "no": 0, "net": 10}}
-{"ts": 326364643, "time": "1970-01-04T18:39:24.643000", "token": "YES", "side": "SELL", "size": 20, "price_cents": 50, "value_usd": 10.0, "order_id": "order_1", "realized_pnl_cents": 0, "realized_pnl_usd": 0.0, "inventory": {"yes": 30, "no": 0, "net": 30}}

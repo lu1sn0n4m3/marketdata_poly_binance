@@ -19,7 +19,7 @@ class TestAppConfig:
         """Test default configuration values."""
         config = AppConfig()
 
-        assert config.strategy_hz == 20
+        assert config.strategy_hz == 50
         assert config.base_spread_cents == 3
         assert config.max_position == 500
         assert config.gross_cap == 1000
@@ -214,6 +214,8 @@ class TestMMApplicationComponents:
             size=10,
             fee=0.0,
             ts_exchange=now_ms(),
+            trade_id="trade_queue_test_1",
+            role="MAKER",
         )
         event_queue.put(fill)
 
@@ -222,6 +224,8 @@ class TestMMApplicationComponents:
         assert isinstance(event, FillEvent)
         assert event.server_order_id == "order_123"
         assert event.size == 10
+        assert event.trade_id == "trade_queue_test_1"
+        assert event.fill_id == "SETTLED:MAKER:trade_queue_test_1:order_123"
 
     def test_intent_mailbox_integration(self):
         """Test intent mailbox coalescing."""

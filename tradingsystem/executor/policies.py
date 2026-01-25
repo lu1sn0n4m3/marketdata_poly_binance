@@ -47,7 +47,8 @@ class ExecutorPolicies:
 
     # Price tolerance for order matching (cents)
     # Orders within this tolerance are considered "same price"
-    price_tolerance: int = 0
+    # Set to 1-2 to avoid churning orders when BBO moves by tiny amounts
+    price_tolerance: int = 1
 
     # Queue-preserving replacement policy:
     # - Price change: ALWAYS replace (price differs beyond tolerance)
@@ -67,3 +68,8 @@ class ExecutorPolicies:
 
     # Maximum time to keep tombstoned orders for orphan fill matching (ms)
     tombstone_retention_ms: int = 30000
+
+    # Minimum interval between reconciliation cycles per slot (ms)
+    # Prevents fast cancel/replace cycling when BBO is moving rapidly
+    # This is per-slot, so bid and ask can reconcile independently
+    min_reconcile_interval_ms: int = 25  # Match gateway rate limit for max speed

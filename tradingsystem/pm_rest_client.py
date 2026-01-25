@@ -121,6 +121,29 @@ class PolymarketRestClient:
         self._ensure_initialized()
         return (self._api_key, self._api_secret, self._passphrase)
 
+    @property
+    def maker_address(self) -> str:
+        """
+        Get our wallet/maker address for matching MAKER fills.
+
+        Returns the funder address if using a proxy wallet,
+        otherwise derives the address from the private key.
+
+        Returns:
+            Wallet address (checksummed)
+        """
+        if self._funder:
+            return self._funder
+
+        # Derive from private key if no funder
+        try:
+            from eth_account import Account
+            acct = Account.from_key(self._private_key)
+            return acct.address
+        except Exception as e:
+            logger.warning(f"Could not derive maker address: {e}")
+            return ""
+
     def place_order(
         self,
         token_id: str,
@@ -416,6 +439,60 @@ class PolymarketRestClient:
         except Exception as e:
             logger.warning(f"Get open orders failed: {e}")
             return []
+
+    def get_balances(self) -> dict[str, float]:
+        """
+        Get token balances for the user.
+
+        Returns:
+            Dict mapping token_id -> balance in shares
+        """
+        self._ensure_initialized()
+
+        try:
+            # py_clob_client uses get_balance_allowance for this
+            # It returns a dict with 'balance' and 'allowance' for each token
+            # The response format is: [{"token_id": ..., "balance": ..., "allowance": ...}, ...]
+            response = self._client.get_balance_allowance()
+
+            if not response:
+                logger.warning("get_balances: No response from API")
+                return {}
+
+            # Convert to token_id -> balance dict
+            balances = {}
+            if isinstance(response, list):
+                for item in response:
+                    token_id = item.get("asset_id") or item.get("token_id", "")
+                    balance = item.get("balance", 0)
+                    if token_id:
+                        # Balance is typically in shares (integer)
+                        balances[token_id] = float(balance)
+            elif isinstance(response, dict):
+                # Might be a single response or different format
+                if "balance" in response:
+                    # Single token response
+                    token_id = response.get("asset_id") or response.get("token_id", "")
+                    if token_id:
+                        balances[token_id] = float(response.get("balance", 0))
+                else:
+                    # Might be token_id -> balance directly
+                    for k, v in response.items():
+                        if isinstance(v, (int, float)):
+                            balances[k] = float(v)
+                        elif isinstance(v, dict):
+                            balances[k] = float(v.get("balance", 0))
+
+            logger.debug(f"get_balances: Retrieved {len(balances)} token balances")
+            return balances
+
+        except AttributeError:
+            # py_clob_client might not have get_balance_allowance
+            logger.warning("get_balances: get_balance_allowance not available in py_clob_client")
+            return {}
+        except Exception as e:
+            logger.warning(f"Get balances failed: {e}")
+            return {}
 
     @staticmethod
     def _is_retryable_error(error_msg: str) -> bool:

@@ -3,7 +3,7 @@
 Live Integration Test Runner with DummyTightStrategy.
 
 Runs a tight quoting strategy that:
-- Quotes 1 cent off BBO when flat
+- Quotes AT the BBO when flat (will get filled!)
 - Only quotes exit side when holding inventory
 
 WARNING: This strategy WILL get filled! Use small size and monitor closely.
@@ -27,7 +27,7 @@ import time
 
 from .config import AppConfig
 from .app import MMApplication
-from .dummy_tight_strategy import DummyTightStrategy
+from .strategy import DummyTightStrategy
 
 
 def main():
@@ -88,7 +88,7 @@ def main():
     logger.warning("=" * 60)
     logger.warning(f"Order size: {args.size} shares")
     logger.warning("This strategy WILL get filled!")
-    logger.warning("- Flat: bid at BBO-1, ask at BBO+1")
+    logger.warning("- Flat: bid at best bid, ask at best ask (AT the BBO)")
     logger.warning("- Long: only ask at best ask (exit)")
     logger.warning("- Short: only bid at best bid (exit)")
     logger.warning("=" * 60)
@@ -146,6 +146,49 @@ def main():
         logger.info("FINAL SESSION SUMMARY")
         logger.info("=" * 60)
         _log_final_summary(logger, final_stats, time.time() - start_time)
+
+        # Trigger emergency close to flatten all positions
+        inv = final_stats.get("inventory", {})
+        if inv.get("yes", 0) > 0 or inv.get("no", 0) > 0:
+            logger.warning("=" * 60)
+            logger.warning("EMERGENCY CLOSE - Flattening all positions")
+            logger.warning("=" * 60)
+            app.emergency_close()
+
+            # Wait for positions to close (up to 30 seconds)
+            logger.info("Waiting for positions to close...")
+            close_timeout = 30
+            close_start = time.time()
+            while time.time() - close_start < close_timeout:
+                stats = app.get_stats()
+                inv = stats.get("inventory", {})
+                yes_pos = inv.get("yes", 0)
+                no_pos = inv.get("no", 0)
+
+                if yes_pos == 0 and no_pos == 0:
+                    logger.info("All positions closed successfully!")
+                    break
+
+                # Check if executor is STOPPED (done closing)
+                exec_stats = stats.get("executor", {})
+                mode = exec_stats.get("mode", "UNKNOWN")
+                if mode == "STOPPED":
+                    if yes_pos > 0 or no_pos > 0:
+                        logger.warning(
+                            f"Executor STOPPED but positions remain: YES={yes_pos} NO={no_pos}"
+                        )
+                    break
+
+                logger.info(
+                    f"Closing... YES={yes_pos} NO={no_pos} mode={mode}"
+                )
+                time.sleep(1.0)
+            else:
+                logger.error(
+                    f"Emergency close timeout! Positions may remain open: "
+                    f"YES={yes_pos} NO={no_pos}"
+                )
+
         logger.info("Stopping application...")
         app.stop()
         logger.info("Test complete.")

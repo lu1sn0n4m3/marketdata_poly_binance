@@ -89,6 +89,41 @@ class PolymarketBookSnapshot:
         # Derive from NO: YES_mid = 100 - NO_mid
         return 100 - self.no_top.mid_px
 
+    @property
+    def arbitrage_yes_top(self) -> PolymarketBookTop:
+        """
+        Arbitrage-adjusted YES BBO considering both books.
+
+        On Polymarket, YES + NO = 100. So you can effectively:
+        - Buy YES at min(YES ask, 100 - NO bid)
+        - Sell YES at max(YES bid, 100 - NO ask)
+
+        This gives the true tradable prices, not just raw book levels.
+        """
+        # Compute arbitrage-adjusted prices
+        # YES bid = max(raw YES bid, 100 - NO ask)
+        arb_bid_px = max(self.yes_top.best_bid_px, 100 - self.no_top.best_ask_px)
+        # YES ask = min(raw YES ask, 100 - NO bid)
+        arb_ask_px = min(self.yes_top.best_ask_px, 100 - self.no_top.best_bid_px)
+
+        # Use size from whichever side provides the better price
+        if self.yes_top.best_bid_px >= 100 - self.no_top.best_ask_px:
+            arb_bid_sz = self.yes_top.best_bid_sz
+        else:
+            arb_bid_sz = self.no_top.best_ask_sz
+
+        if self.yes_top.best_ask_px <= 100 - self.no_top.best_bid_px:
+            arb_ask_sz = self.yes_top.best_ask_sz
+        else:
+            arb_ask_sz = self.no_top.best_bid_sz
+
+        return PolymarketBookTop(
+            best_bid_px=arb_bid_px,
+            best_bid_sz=arb_bid_sz,
+            best_ask_px=arb_ask_px,
+            best_ask_sz=arb_ask_sz,
+        )
+
 
 @dataclass(slots=True)
 class BinanceSnapshot:

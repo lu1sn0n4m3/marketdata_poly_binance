@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Optional, Callable, Union
 
-from ..types import QuoteMode, DesiredQuoteSet, StrategyIntentEvent, now_ms
+from ..types import QuoteMode, DesiredQuoteSet, StrategyIntentEvent, ExecutorEventType, now_ms
 from .base import Strategy, StrategyInput
 
 logger = logging.getLogger(__name__)
@@ -251,8 +251,9 @@ class StrategyRunner:
         if self._event_queue is not None:
             # Wrap as event and push to executor queue directly
             event = StrategyIntentEvent(
-                intent=intent,
+                event_type=ExecutorEventType.STRATEGY_INTENT,
                 ts_local_ms=now_ms(),
+                intent=intent,
             )
             try:
                 self._event_queue.put_nowait(event)

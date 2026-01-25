@@ -130,14 +130,16 @@ class PolymarketMarketFeed(ThreadedWsClient):
         bids = data.get("bids", [])
         asks = data.get("asks", [])
 
-        # Extract TOB - bids/asks sorted ascending, best is last
+        # Extract TOB
+        # BIDS: sorted ascending (0.01, 0.02, ... 0.32), best bid (highest) is LAST
+        # ASKS: sorted descending (0.99, 0.98, ... 0.34), best ask (lowest) is LAST
         if bids:
             best_bid = self._parse_level(bids[-1])
         else:
             best_bid = (0, 0)
 
         if asks:
-            best_ask = self._parse_level(asks[0])
+            best_ask = self._parse_level(asks[-1])  # FIX: was asks[0], but asks are sorted descending
         else:
             best_ask = (100, 0)
 
@@ -154,32 +156,52 @@ class PolymarketMarketFeed(ThreadedWsClient):
         """Handle incremental price change."""
         for change in data.get("price_changes", []):
             asset_id = change.get("asset_id", "")
-            best_bid = self._price_str_to_cents(change.get("best_bid"))
-            best_ask = self._price_str_to_cents(change.get("best_ask"))
+            raw_bid = change.get("best_bid")
+            raw_ask = change.get("best_ask")
+            best_bid = self._price_str_to_cents(raw_bid)
+            best_ask = self._price_str_to_cents(raw_ask)
 
-            # Size info not always provided in price_change, keep existing
+            # BUG FIX: If field is missing, keep old value instead of overwriting with 0
             if asset_id == self._yes_token_id:
-                self._yes_bbo = (best_bid, self._yes_bbo[1], best_ask, self._yes_bbo[3])
+                new_bid = best_bid if raw_bid is not None else self._yes_bbo[0]
+                new_ask = best_ask if raw_ask is not None else self._yes_bbo[2]
+                self._yes_bbo = (new_bid, self._yes_bbo[1], new_ask, self._yes_bbo[3])
             elif asset_id == self._no_token_id:
-                self._no_bbo = (best_bid, self._no_bbo[1], best_ask, self._no_bbo[3])
+                new_bid = best_bid if raw_bid is not None else self._no_bbo[0]
+                new_ask = best_ask if raw_ask is not None else self._no_bbo[2]
+                self._no_bbo = (new_bid, self._no_bbo[1], new_ask, self._no_bbo[3])
 
         self._publish_to_cache()
 
     def _handle_best_bid_ask(self, data: dict) -> None:
         """Handle direct BBO update."""
         asset_id = data.get("asset_id", "")
-        best_bid = self._price_str_to_cents(data.get("best_bid"))
-        best_ask = self._price_str_to_cents(data.get("best_ask"))
+        raw_bid = data.get("best_bid")
+        raw_ask = data.get("best_ask")
+        best_bid = self._price_str_to_cents(raw_bid)
+        best_ask = self._price_str_to_cents(raw_ask)
 
+        # BUG FIX: If field is missing, keep old value instead of overwriting with 0
         if asset_id == self._yes_token_id:
-            self._yes_bbo = (best_bid, self._yes_bbo[1], best_ask, self._yes_bbo[3])
+            new_bid = best_bid if raw_bid is not None else self._yes_bbo[0]
+            new_ask = best_ask if raw_ask is not None else self._yes_bbo[2]
+            self._yes_bbo = (new_bid, self._yes_bbo[1], new_ask, self._yes_bbo[3])
         elif asset_id == self._no_token_id:
-            self._no_bbo = (best_bid, self._no_bbo[1], best_ask, self._no_bbo[3])
+            new_bid = best_bid if raw_bid is not None else self._no_bbo[0]
+            new_ask = best_ask if raw_ask is not None else self._no_bbo[2]
+            self._no_bbo = (new_bid, self._no_bbo[1], new_ask, self._no_bbo[3])
 
         self._publish_to_cache()
 
     def _publish_to_cache(self) -> None:
         """Publish current state to PolymarketCache."""
+        # Debug: log extreme spreads
+        yes_spread = self._yes_bbo[2] - self._yes_bbo[0]  # ask - bid
+        if yes_spread > 50:  # More than 50 cent spread
+            logger.warning(
+                f"[WIDE_SPREAD] YES bid={self._yes_bbo[0]} ask={self._yes_bbo[2]} "
+                f"spread={yes_spread}c NO bid={self._no_bbo[0]} ask={self._no_bbo[2]}"
+            )
         self._cache.update_from_ws(
             yes_bbo=self._yes_bbo,
             no_bbo=self._no_bbo,

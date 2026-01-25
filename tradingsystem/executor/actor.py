@@ -130,8 +130,9 @@ class ExecutorActor:
         self._state = ExecutorState()
 
         # Deduplication: track processed fills to avoid double-counting
-        # Key: (order_id, size, price) - unique per fill event
-        self._processed_fills: set[tuple[str, int, int]] = set()
+        # Key: fill_id (TAKER:trade_id or MAKER:trade_id:order_id)
+        # This ensures proper dedup when same trade arrives as MATCHED->MINED->CONFIRMED
+        self._processed_fills: set[str] = set()
 
         # Threading
         self._stop_event = threading.Event()
@@ -149,14 +150,14 @@ class ExecutorActor:
 
     def start(self) -> None:
         """Start executor thread."""
-        from ..types import now_ms
+        from ..types import wall_ms
 
         if self._thread and self._thread.is_alive():
             logger.warning("ExecutorActor already running")
             return
 
-        # Record session start time
-        self._session_start_ts = now_ms()
+        # Record session start time (wall clock for comparison with exchange timestamps)
+        self._session_start_ts = wall_ms()
         logger.info(f"Session started at {self._session_start_ts}")
 
         self._stop_event.clear()
@@ -211,6 +212,7 @@ class ExecutorActor:
             FillEvent,
             TimerTickEvent,
             StrategyIntentEvent,
+            BarrierEvent,
             now_ms,
         )
 
@@ -228,6 +230,8 @@ class ExecutorActor:
             self._on_fill(event, ts)
         elif isinstance(event, TimerTickEvent):
             self._on_timer_tick(ts)
+        elif isinstance(event, BarrierEvent):
+            self._on_test_barrier(event)
         else:
             logger.warning(f"Unknown event type: {type(event)}")
 
@@ -241,9 +245,15 @@ class ExecutorActor:
 
         state = self._state
 
-        # Block if in RESYNCING mode
+        # Block if not in NORMAL mode
         if state.mode == ExecutorMode.RESYNCING:
             logger.debug("In RESYNCING mode, ignoring intent")
+            return
+        if state.mode == ExecutorMode.CLOSING:
+            logger.debug("In CLOSING mode, ignoring intent")
+            return
+        if state.mode == ExecutorMode.STOPPED:
+            logger.debug("In STOPPED mode, ignoring intent")
             return
 
         # Check cooldown
@@ -280,6 +290,22 @@ class ExecutorActor:
                 f"(residual: {report.bid_residual}/{report.ask_residual})"
             )
 
+        # Debug: log planned orders and their prices
+        for order in plan.bid.orders:
+            logger.info(
+                f"[PLAN] bid: {order.token.name} {order.side.name} {order.sz}@{order.px}c kind={order.kind.name}"
+            )
+        for order in plan.ask.orders:
+            logger.info(
+                f"[PLAN] ask: {order.token.name} {order.side.name} {order.sz}@{order.px}c kind={order.kind.name}"
+            )
+
+        # Log latency from book update to reconcile
+        if intent.book_ts > 0:
+            from ..types import now_ms
+            latency_ms = now_ms() - intent.book_ts
+            logger.info(f"[LATENCY] book_to_plan: {latency_ms}ms (seq={intent.pm_seq})")
+
         # Reconcile each slot
         self._reconcile_slot(state.bid_slot, plan.bid, ts)
         self._reconcile_slot(state.ask_slot, plan.ask, ts)
@@ -293,6 +319,10 @@ class ExecutorActor:
         """Reconcile a single slot with its planned orders."""
         from .planner import LegPlan
 
+        # Rate limit check: prevent fast cancel/replace cycling
+        if slot.is_rate_limited(ts, self._policies.min_reconcile_interval_ms):
+            return
+
         # Get effects from reconciler (queue-preserving policy)
         effects = reconcile_slot(
             plan=leg_plan,
@@ -303,6 +333,9 @@ class ExecutorActor:
 
         if effects.is_empty:
             return
+
+        # Record this reconciliation to enforce rate limiting
+        slot.record_submission(ts)
 
         # Execute cancels first
         if effects.cancels:
@@ -467,11 +500,18 @@ class ExecutorActor:
                 else:
                     self._state.reservations.release_no(pending.spec.sz)
 
-            # Check for balance error -> trigger resync
+            # Log error - DON'T resync on every balance error
+            # "Insufficient balance" often happens due to race conditions:
+            # - Multiple orders competing for same USDC
+            # - Partial fills changing available balance
+            # Let the next reconcile cycle handle it naturally
             error_code = normalize_error(event.error_kind)
             if error_code == ErrorCode.INSUFFICIENT_BALANCE:
-                logger.warning("Insufficient balance error - triggering resync")
-                self._trigger_resync("insufficient_balance")
+                logger.warning(
+                    f"Insufficient balance for {pending.spec.token.name} "
+                    f"{pending.spec.side.name} {pending.spec.sz}@{pending.spec.px}c - "
+                    f"will retry on next intent"
+                )
             else:
                 logger.warning(f"Place failed: {event.error_kind}")
 
@@ -497,6 +537,11 @@ class ExecutorActor:
             # Remove from working orders
             order = slot.orders.pop(pending.server_order_id, None)
 
+            # CRITICAL: Tombstone the order so late-arriving fills can be processed!
+            # Fills can arrive after cancel due to network delays.
+            if order:
+                self._tombstone_order(order, ts)
+
             # Release reservation if this was a SELL
             if order and order.order_spec.side == Side.SELL:
                 remaining = order.remaining_sz
@@ -507,7 +552,38 @@ class ExecutorActor:
 
             logger.debug(f"Cancel confirmed: {pending.server_order_id[:20]}...")
         else:
-            logger.warning(f"Cancel failed: {event.error_kind}")
+            # Check if this is an "order gone" error - order matched/filled or already canceled
+            # In these cases the order is NOT on the venue anymore, so remove it from working state
+            error_lower = (event.error_kind or "").lower()
+            order_is_gone = (
+                "matched" in error_lower or
+                "not found" in error_lower or
+                "already" in error_lower or
+                "canceled" in error_lower
+            )
+
+            if order_is_gone:
+                order = slot.orders.pop(pending.server_order_id, None)
+                if order:
+                    # Tombstone for late-arriving fills (order may have been matched)
+                    self._tombstone_order(order, ts)
+
+                    # Release reservation if SELL (order is gone from venue)
+                    if order.order_spec.side == Side.SELL:
+                        remaining = order.remaining_sz
+                        if order.order_spec.token == Token.YES:
+                            self._state.reservations.release_yes(remaining)
+                        else:
+                            self._state.reservations.release_no(remaining)
+
+                    logger.info(
+                        f"Cancel failed ({event.error_kind}) - order removed from state: "
+                        f"{pending.server_order_id[:20]}..."
+                    )
+                else:
+                    logger.warning(f"Cancel failed: {event.error_kind}")
+            else:
+                logger.warning(f"Cancel failed: {event.error_kind}")
 
         # Check if slot can transition back to IDLE
         slot.on_ack_received()
@@ -572,6 +648,11 @@ class ExecutorActor:
 
             logger.info(f"Cancel ack: {event.server_order_id[:20]}...")
 
+            # Check if we're in CLOSING mode and should place closing orders
+            if state.mode == ExecutorMode.CLOSING:
+                self._maybe_place_closing_orders(ts)
+                return
+
             # Re-reconcile with last intent if appropriate
             if state.last_intent and slot and slot.can_submit():
                 self._on_intent(state.last_intent, ts)
@@ -584,8 +665,15 @@ class ExecutorActor:
         """
         Handle fill event.
 
-        CRITICAL: Always update inventory from fills - never drop!
-        Even unknown fills trigger resync but still update inventory.
+        Fills have two phases:
+        1. MATCHED (is_pending=True): Update pending inventory immediately.
+           Strategy sees this to avoid duplicate orders. Can't sell yet.
+        2. MINED (is_pending=False): Settle the pending inventory.
+           Move from pending to settled. Now can be sold.
+
+        CRITICAL: Only update inventory for fills we KNOW about.
+        The WebSocket sends ALL makers in a trade, not just our orders.
+        Unknown fills are for other people's orders - ignore them.
         """
         from ..types import Side, Token
 
@@ -600,19 +688,22 @@ class ExecutorActor:
             )
             return
 
-        # Deduplication
-        fill_key = (order_id, event.size, event.price)
-        if fill_key in self._processed_fills:
-            logger.warning(
-                f"Skipping duplicate fill: order={order_id[:20]}... "
-                f"size={event.size} price={event.price}c"
+        # Deduplication using fill_id (includes settlement status for proper dedup)
+        # MATCHED and MINED have different fill_ids so both get processed
+        # Duplicate MINED messages deduplicate
+        fill_id = event.fill_id
+        if fill_id in self._processed_fills:
+            logger.debug(
+                f"Skipping duplicate fill: fill_id={fill_id[:40]}... "
+                f"(already processed)"
             )
             return
-        self._processed_fills.add(fill_key)
+        self._processed_fills.add(fill_id)
 
         # Find order in slots or tombstones
         slot, order = state.find_order(order_id)
         is_orphan = False
+        is_unknown = False
 
         if slot is None:
             # Check tombstoned orders
@@ -621,68 +712,118 @@ class ExecutorActor:
                 logger.info(f"Processing orphan fill for tombstoned order: {order_id[:20]}...")
                 is_orphan = True
             else:
-                # Unknown order - trigger resync but still update inventory
-                logger.warning(
-                    f"Fill for unknown order: {order_id[:20]}... "
-                    "- updating inventory and triggering resync"
+                # Unknown order - but still process it!
+                # The feed already filters by maker_address, so if we receive this fill,
+                # it's definitely ours. The order might not be in slots because:
+                # - Fill arrived before place ack (race condition)
+                # - Order was canceled but not tombstoned
+                # - Order was placed in a previous session
+                # We MUST update inventory to prevent duplicate orders.
+                logger.info(
+                    f"Processing fill for unknown order (trusting feed filter): {order_id[:20]}... "
+                    f"{event.token.name} {event.side.name} {event.size}@{event.price}c"
                 )
-                # Still fall through to update inventory
+                is_unknown = True
 
-        # ALWAYS update inventory (never drop fills)
-        state.inventory.update_from_fill(
-            token=event.token,
-            side=event.side,
-            size=event.size,
-            ts=ts,
-        )
+        # Update inventory based on fill type (pending vs settled)
+        pending_str = "PENDING" if event.is_pending else "SETTLED"
 
-        # Release reservation for SELL fills
-        if event.side == Side.SELL:
+        if event.is_pending:
+            # MATCHED fill - update pending inventory
+            # Strategy sees this, but can't SELL yet
+            state.inventory.update_from_fill(
+                token=event.token,
+                side=event.side,
+                size=event.size,
+                ts=ts,
+                is_pending=True,  # Update pending inventory
+            )
+            logger.info(
+                f"[FILL {pending_str}] Updated pending inventory: "
+                f"pending_yes={state.inventory.pending_yes} pending_no={state.inventory.pending_no}"
+            )
+        else:
+            # MINED/CONFIRMED fill - settle the pending inventory
+            # Move from pending to settled (or add directly if MATCHED was missed)
+            state.inventory.settle_pending(
+                token=event.token,
+                side=event.side,
+                size=event.size,
+                ts=ts,
+            )
+            logger.info(
+                f"[FILL {pending_str}] Settled inventory: "
+                f"YES={state.inventory.I_yes} NO={state.inventory.I_no} "
+                f"(pending_yes={state.inventory.pending_yes} pending_no={state.inventory.pending_no})"
+            )
+
+        # Release reservation for SELL fills (only on MINED, not MATCHED)
+        # For BUY fills, no reservation to release
+        # For SELL fills, release happens when MINED (tokens actually transferred)
+        if not event.is_pending and event.side == Side.SELL:
             if event.token == Token.YES:
                 state.reservations.release_yes(event.size)
             else:
                 state.reservations.release_no(event.size)
 
-        # Update working order if found (not orphan)
-        if slot and order and not is_orphan:
+        # Update working order if found (not orphan or unknown)
+        # Only do this for MINED fills (order state changes are final then)
+        if not event.is_pending and slot and order and not is_orphan and not is_unknown:
             self._update_order_from_fill(slot, order, event, ts)
 
-        # Record PnL
-        realized_pnl, avg_cost = state.pnl.record_fill(
-            ts=ts,
-            token=event.token,
-            side=event.side,
-            size=event.size,
-            price=event.price,
-            order_id=order_id,
-        )
+        # Record PnL (only for settled/MINED fills)
+        # We don't want to double-count PnL
+        realized_pnl = 0.0
+        if not event.is_pending:
+            realized_pnl, avg_cost = state.pnl.record_fill(
+                ts=ts,
+                token=event.token,
+                side=event.side,
+                size=event.size,
+                price=event.price,
+                order_id=order_id,
+            )
 
-        # Log fill
+        # Log fill with inventory info
         side_str = "BUY" if event.side == Side.BUY else "SELL"
         fill_value_usd = (event.size * event.price) / 100
+        if is_orphan:
+            marker = " [ORPHAN]"
+        elif is_unknown:
+            marker = " [UNKNOWN_ORDER]"
+        else:
+            marker = ""
         logger.info(
-            f"FILL: {side_str} {event.size}x{event.token.name}@{event.price}c "
-            f"(${fill_value_usd:.2f}) | PnL: realized={realized_pnl}c "
-            f"total={state.pnl.realized_pnl_cents}c (${state.pnl.realized_pnl_cents/100:.2f})"
+            f"FILL ({pending_str}){marker}: {side_str} {event.size}x{event.token.name}@{event.price}c "
+            f"(${fill_value_usd:.2f}) | settled: YES={state.inventory.I_yes} NO={state.inventory.I_no} "
+            f"| pending: YES={state.inventory.pending_yes} NO={state.inventory.pending_no} "
+            f"| effective_net={state.inventory.effective_net_E}"
         )
 
-        # Write to trade log
-        self._trade_logger.log_fill(
-            ts=ts,
-            token=event.token.name,
-            side=side_str,
-            size=event.size,
-            price=event.price,
-            order_id=order_id,
-            realized_pnl=realized_pnl,
-            inventory_yes=state.inventory.I_yes,
-            inventory_no=state.inventory.I_no,
-            net_position=state.inventory.net_E,
-        )
+        # Write to trade log (only for settled fills)
+        if not event.is_pending:
+            self._trade_logger.log_fill(
+                ts=ts,
+                token=event.token.name,
+                side=side_str,
+                size=event.size,
+                price=event.price,
+                order_id=order_id,
+                realized_pnl=realized_pnl,
+                inventory_yes=state.inventory.I_yes,
+                inventory_no=state.inventory.I_no,
+                net_position=state.inventory.net_E,
+            )
 
-        # Trigger resync for unknown fills (after updating inventory)
-        if slot is None and not is_orphan:
-            self._trigger_resync("unknown_fill")
+        # NOTE: We no longer trigger resync for unknown fills because:
+        # 1. The feed now filters by maker_address, so unknown fills are still OURS
+        # 2. Unknown fills happen when the fill arrives before place ack (race condition)
+        # 3. We already updated inventory, so no need to resync
+
+        # Check if we're in CLOSING mode and should transition to STOPPED
+        # Only check on settled fills
+        if not event.is_pending and state.mode == ExecutorMode.CLOSING:
+            self._check_closing_complete(ts)
 
     def _update_order_from_fill(
         self,
@@ -727,6 +868,21 @@ class ExecutorActor:
         self._check_timeouts(ts)
         self._cleanup_tombstones(ts)
 
+        # In CLOSING mode, try to place closing orders
+        # (covers the case where there were no open orders to cancel)
+        if self._state.mode == ExecutorMode.CLOSING:
+            self._maybe_place_closing_orders(ts)
+
+    def _on_test_barrier(self, event: "BarrierEvent") -> None:
+        """
+        Handle test barrier event.
+
+        Sets the barrier_processed event to signal the test that
+        all events queued before this barrier have been processed.
+        """
+        if event.barrier_processed:
+            event.barrier_processed.set()
+
     def _on_idle_tick(self) -> None:
         """Called on queue timeout - lightweight maintenance."""
         from ..types import now_ms
@@ -764,6 +920,22 @@ class ExecutorActor:
         cleared = cleanup_expired_tombstones(self._state, ts)
         if cleared > 0:
             logger.debug(f"Cleared {cleared} expired tombstones")
+
+    def _tombstone_order(self, order: "WorkingOrder", ts: int) -> None:
+        """
+        Tombstone an order for orphan fill accounting.
+
+        When an order is canceled or removed, we keep it in tombstones so that
+        late-arriving fills (due to network delays) can still be processed.
+
+        Args:
+            order: The order to tombstone
+            ts: Current timestamp
+        """
+        expiry_ts = ts + self._policies.tombstone_retention_ms
+        self._state.tombstoned_orders[order.server_order_id] = order
+        self._state.tombstone_expiry_ts[order.server_order_id] = expiry_ts
+        logger.debug(f"Tombstoned order: {order.server_order_id[:20]}...")
 
     # -------------------------------------------------------------------------
     # RESYNC & CANCEL-ALL
@@ -844,6 +1016,205 @@ class ExecutorActor:
         with self._counter_lock:
             self._client_order_counter += 1
             return f"exec_{self._client_order_counter}_{now_ms()}"
+
+    # -------------------------------------------------------------------------
+    # EMERGENCY CLOSE
+    # -------------------------------------------------------------------------
+
+    def emergency_close(self) -> None:
+        """
+        Emergency close: cancel all orders and liquidate all positions.
+
+        This is a one-way transition to STOPPED state.
+
+        Sequence:
+        1. Set mode to CLOSING (blocks all intents)
+        2. Submit cancel-all
+        3. After cancel acks, place marketable SELLs for any inventory
+        4. After closing orders fill/ack, transition to STOPPED
+
+        Can be called from any thread (e.g., signal handler).
+        """
+        from ..types import now_ms
+
+        state = self._state
+
+        # Only allow from NORMAL or RESYNCING
+        if state.mode == ExecutorMode.STOPPED:
+            logger.warning("Already in STOPPED mode")
+            return
+        if state.mode == ExecutorMode.CLOSING:
+            logger.warning("Already in CLOSING mode")
+            return
+
+        logger.warning("=" * 60)
+        logger.warning("EMERGENCY CLOSE INITIATED")
+        logger.warning("=" * 60)
+
+        ts = now_ms()
+
+        # Transition to CLOSING
+        state.mode = ExecutorMode.CLOSING
+
+        # Log current inventory
+        logger.warning(
+            f"Current inventory: YES={state.inventory.I_yes} NO={state.inventory.I_no}"
+        )
+
+        # Submit cancel-all
+        logger.warning("Cancelling all open orders...")
+        self._gateway.submit_cancel_all(self._market_id)
+
+        # Clear tracked orders (we'll place closing orders fresh)
+        state.bid_slot.clear()
+        state.ask_slot.clear()
+        state.rebuild_reservations(0)  # No buffer for closing
+
+        # Set cooldown
+        state.risk.last_cancel_all_ts = ts
+        state.risk.set_cooldown(ts, self._policies.cooldown_after_cancel_all_ms)
+
+        # Wait briefly for cancel-all to propagate, then place closing orders
+        # In practice, _maybe_place_closing_orders will be called from:
+        # - _on_cancel_ack when cancels confirm
+        # - Idle tick if no orders were open
+        # Schedule an immediate check via the event queue
+        from ..types import TimerTickEvent, ExecutorEventType
+        try:
+            event = TimerTickEvent(
+                event_type=ExecutorEventType.TIMER_TICK,
+                ts_local_ms=ts,
+            )
+            self._event_queue.put_nowait(event)
+            logger.debug("TimerTickEvent queued for closing orders")
+        except Exception as e:
+            logger.warning(f"Failed to queue TimerTickEvent: {e}")
+
+    def _maybe_place_closing_orders(self, ts: int) -> None:
+        """
+        Place closing orders if conditions are met.
+
+        Called after cancel acks in CLOSING mode.
+        Places marketable SELLs to close any inventory.
+        """
+        state = self._state
+
+        if state.mode != ExecutorMode.CLOSING:
+            return
+
+        # Check if all slots are IDLE (no pending operations)
+        if not state.bid_slot.can_submit() or not state.ask_slot.can_submit():
+            logger.debug("Slots busy, waiting before placing closing orders")
+            return
+
+        # Check if we have any inventory to close
+        yes_to_close = state.inventory.I_yes
+        no_to_close = state.inventory.I_no
+
+        if yes_to_close == 0 and no_to_close == 0:
+            logger.warning("No inventory to close, transitioning to STOPPED")
+            state.mode = ExecutorMode.STOPPED
+            logger.warning("=" * 60)
+            logger.warning("EMERGENCY CLOSE COMPLETE - MODE: STOPPED")
+            logger.warning("=" * 60)
+            return
+
+        # Place closing orders
+        # NOTE: Market orders (price=1 cent, marketable) have NO min_size constraint
+        # on Polymarket, so we can close ANY position regardless of size.
+        logger.warning(f"Placing closing orders: SELL YES {yes_to_close}, SELL NO {no_to_close}")
+
+        # Close YES position (any amount > 0)
+        if yes_to_close > 0:
+            self._place_closing_order(
+                token_str="YES",
+                token_id=self._yes_token_id,
+                size=yes_to_close,
+                ts=ts,
+            )
+
+        # Close NO position (any amount > 0)
+        if no_to_close > 0:
+            self._place_closing_order(
+                token_str="NO",
+                token_id=self._no_token_id,
+                size=no_to_close,
+                ts=ts,
+            )
+
+    def _place_closing_order(
+        self,
+        token_str: str,
+        token_id: str,
+        size: int,
+        ts: int,
+    ) -> None:
+        """
+        Place a single closing order (marketable SELL).
+
+        Uses price of 1 cent to ensure immediate fill at best bid.
+        """
+        from ..types import Token, Side, RealOrderSpec
+
+        token = Token.YES if token_str == "YES" else Token.NO
+
+        # Marketable price: 1 cent (will fill at best bid)
+        # This is aggressive but ensures we close
+        price = 1
+
+        spec = RealOrderSpec(
+            token=token,
+            token_id=token_id,
+            side=Side.SELL,
+            px=price,
+            sz=size,
+        )
+        spec.client_order_id = self._next_client_order_id()
+
+        logger.warning(f"Placing closing order: SELL {size} {token_str} @ {price}c (marketable)")
+
+        # Submit via gateway
+        action_id = self._gateway.submit_place(spec)
+
+        # Track as pending (use "closing" as kind)
+        self._state.ask_slot.pending_places[action_id] = PendingPlace(
+            action_id=action_id,
+            spec=spec,
+            sent_at_ts=ts,
+            order_kind="closing",  # Special kind for closing orders
+        )
+
+    def _check_closing_complete(self, ts: int) -> None:
+        """
+        Check if emergency close is complete and transition to STOPPED.
+
+        Called after fills in CLOSING mode.
+        Transitions to STOPPED when both YES and NO inventory are 0.
+
+        NOTE: Market orders (price=1 cent) have no min_size constraint,
+        so we always wait until inventory is fully cleared.
+        """
+        state = self._state
+
+        if state.mode != ExecutorMode.CLOSING:
+            return
+
+        yes_remaining = state.inventory.I_yes
+        no_remaining = state.inventory.I_no
+
+        # Check if both positions are fully closed
+        if yes_remaining == 0 and no_remaining == 0:
+            logger.warning("=" * 60)
+            logger.warning("EMERGENCY CLOSE COMPLETE - ALL POSITIONS CLOSED")
+            logger.warning("Final inventory: YES=0 NO=0")
+            state.mode = ExecutorMode.STOPPED
+            logger.warning("MODE: STOPPED")
+            logger.warning("=" * 60)
+
+    @property
+    def mode(self) -> ExecutorMode:
+        """Get current executor mode."""
+        return self._state.mode
 
     # -------------------------------------------------------------------------
     # PUBLIC ACCESSORS

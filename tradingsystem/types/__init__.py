@@ -60,6 +60,7 @@ from .events import (
     FillEvent,
     GatewayResultEvent,
     TimerTickEvent,
+    BarrierEvent,
 )
 
 # Gateway types
@@ -112,6 +113,7 @@ __all__ = [
     "FillEvent",
     "GatewayResultEvent",
     "TimerTickEvent",
+    "BarrierEvent",
     # Gateway
     "GatewayAction",
     "GatewayResult",

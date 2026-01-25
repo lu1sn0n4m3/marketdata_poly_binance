@@ -19,6 +19,7 @@ class DesiredQuoteLeg:
     enabled: bool
     px_yes: int  # Price in cents (0-100)
     sz: int      # Size in shares
+    skip_min_size: bool = False  # If True, skip min_size checks (for marketable dust cleanup)
 
 
 @dataclass(slots=True)
@@ -36,9 +37,10 @@ class DesiredQuoteSet:
     bid_yes: DesiredQuoteLeg  # Synthetic BUY YES
     ask_yes: DesiredQuoteLeg  # Synthetic SELL YES
     reason_flags: set = field(default_factory=set)  # Logging reasons
+    book_ts: int = 0    # Monotonic ms when PM book was received (for latency tracking)
 
     @classmethod
-    def stop(cls, ts: int, pm_seq: int = 0, bn_seq: int = 0, reason: str = "STOP") -> "DesiredQuoteSet":
+    def stop(cls, ts: int, pm_seq: int = 0, bn_seq: int = 0, reason: str = "STOP", book_ts: int = 0) -> "DesiredQuoteSet":
         """Create a STOP intent."""
         return cls(
             created_at_ts=ts,
@@ -48,4 +50,5 @@ class DesiredQuoteSet:
             bid_yes=DesiredQuoteLeg(enabled=False, px_yes=0, sz=0),
             ask_yes=DesiredQuoteLeg(enabled=False, px_yes=0, sz=0),
             reason_flags={reason},
+            book_ts=book_ts,
         )

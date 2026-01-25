@@ -40,7 +40,7 @@ from .strategy import (
     StrategyInput,
     StrategyRunner,
 )
-from .executor import ExecutorActor, ExecutorPolicies
+from .executor import ExecutorActor, ExecutorPolicies, ExecutorMode
 from .gamma_client import GammaClient
 from .market_finder import BitcoinHourlyMarketFinder
 
@@ -136,11 +136,14 @@ class MMApplication:
 
         # User WS (feeds event queue for fills/acks)
         api_key, api_secret, passphrase = self._rest_client.api_credentials
+        # Get our wallet address for matching MAKER fills
+        maker_address = self._rest_client.maker_address or cfg.pm_funder
         self._pm_user_ws = PolymarketUserFeed(
             event_queue=self._event_queue,
             api_key=api_key,
             api_secret=api_secret,
             passphrase=passphrase,
+            maker_address=maker_address,
             on_reconnect=self._on_user_ws_reconnect,
             ws_url=cfg.pm_ws_user_url,
         )
@@ -328,6 +331,10 @@ class MMApplication:
             market_id=market.condition_id,
         )
         self._pm_user_ws.set_markets([market.condition_id])
+        self._pm_user_ws.set_tokens(
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
+        )
 
         # Setup executor with market info
         self._setup_executor(market)
@@ -356,18 +363,39 @@ class MMApplication:
         self._running = True
         logger.info("MM Application started successfully")
 
+    def emergency_close(self) -> None:
+        """
+        Trigger emergency close: cancel all orders and close all positions.
+
+        This initiates a graceful but aggressive shutdown sequence:
+        1. Cancel all open orders
+        2. Place marketable SELLs to close any inventory
+        3. Transition executor to STOPPED state
+
+        Safe to call multiple times (idempotent after first call).
+        """
+        if self._executor:
+            self._executor.emergency_close()
+
     def stop(self) -> None:
         """Stop the application."""
         logger.info("Stopping MM Application...")
         self._stop_event.set()
 
-        # Cancel all orders before stopping
-        if self._gateway and self._current_market:
+        # Skip cancel-all if executor already handled it (CLOSING/STOPPED)
+        should_cancel_all = True
+        if self._executor:
+            mode = self._executor.mode
+            if mode in (ExecutorMode.CLOSING, ExecutorMode.STOPPED):
+                logger.info(f"Executor in {mode.value} mode, skipping cancel-all")
+                should_cancel_all = False
+
+        # Cancel all orders before stopping (unless already in emergency close)
+        if should_cancel_all and self._gateway and self._current_market:
             logger.info("Cancelling all orders...")
             try:
                 self._gateway.submit_cancel_all(self._current_market.condition_id)
                 # Give it a moment to process
-                import time
                 time.sleep(0.5)
             except Exception as e:
                 logger.warning(f"Cancel-all failed: {e}")
@@ -395,11 +423,31 @@ class MMApplication:
         logger.info("MM Application stopped")
 
     def run(self) -> None:
-        """Run until shutdown signal."""
-        # Setup signal handlers
+        """
+        Run until shutdown signal.
+
+        Signal handling:
+        - First SIGINT/SIGTERM: Emergency close (cancel all + close positions)
+        - Second signal or STOPPED: Full shutdown
+        """
+        # Track emergency close state
+        emergency_close_triggered = False
+
         def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}")
-            self._stop_event.set()
+            nonlocal emergency_close_triggered
+
+            if not emergency_close_triggered:
+                # First signal: trigger emergency close
+                logger.warning(f"Received signal {signum} - initiating emergency close")
+                logger.warning("Press Ctrl+C again to force immediate shutdown")
+                emergency_close_triggered = True
+
+                if self._executor:
+                    self._executor.emergency_close()
+            else:
+                # Second signal: force stop
+                logger.warning(f"Received signal {signum} again - forcing shutdown")
+                self._stop_event.set()
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -411,8 +459,13 @@ class MMApplication:
             while not self._stop_event.is_set():
                 self._stop_event.wait(1.0)
 
-                # Check component health
-                if not self._is_healthy():
+                # Check if executor reached STOPPED state
+                if self._executor and self._executor.mode == ExecutorMode.STOPPED:
+                    logger.info("Executor reached STOPPED state, shutting down")
+                    break
+
+                # Check component health (unless in emergency close)
+                if not emergency_close_triggered and not self._is_healthy():
                     logger.error("Component health check failed")
                     break
 
@@ -494,6 +547,11 @@ class MMApplication:
                 "no": inv.I_no,
                 "net_E": inv.net_E,
                 "gross_G": inv.gross_G,
+            }
+
+            # Get executor mode
+            stats["executor"] = {
+                "mode": self._executor.mode.name if hasattr(self._executor, "mode") else "UNKNOWN",
             }
 
             # Get PnL stats with current mid price for unrealized calculation

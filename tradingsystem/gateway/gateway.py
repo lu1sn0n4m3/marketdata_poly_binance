@@ -68,7 +68,7 @@ class Gateway:
         rest_client: "PolymarketRestClient",
         result_queue: queue.Queue,
         max_queue_size: int = 100,
-        min_action_interval_ms: int = 50,
+        min_action_interval_ms: int = 25,
         drop_places_on_cancel_all: bool = True,
     ):
         """

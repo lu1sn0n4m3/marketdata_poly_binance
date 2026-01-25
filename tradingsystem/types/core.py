@@ -48,6 +48,7 @@ class ExecutorEventType(Enum):
     FILL = auto()
     GATEWAY_RESULT = auto()
     TIMER_TICK = auto()
+    TEST_BARRIER = auto()  # For deterministic test synchronization
 
 
 class GatewayActionType(Enum):

@@ -25,7 +25,7 @@ class AppConfig:
     binance_snapshot_url: str = "http://localhost:8080/snapshot/latest"
 
     # Strategy
-    strategy_hz: int = 20
+    strategy_hz: int = 50
     base_spread_cents: int = 3
     base_size: int = 25
     min_size: int = 10
@@ -45,7 +45,7 @@ class AppConfig:
     max_position: int = 500
 
     # Gateway
-    gateway_rate_limit_ms: int = 50  # 20 actions/sec
+    gateway_rate_limit_ms: int = 25  # 40 actions/sec
 
     # Binance poller
     binance_poll_hz: int = 20
@@ -79,7 +79,7 @@ class AppConfig:
             ),
 
             # Strategy
-            strategy_hz=int(os.getenv("STRATEGY_HZ", "20")),
+            strategy_hz=int(os.getenv("STRATEGY_HZ", "50")),
             base_spread_cents=int(os.getenv("BASE_SPREAD_CENTS", "3")),
             base_size=int(os.getenv("BASE_SIZE", "25")),
             min_size=int(os.getenv("MIN_SIZE", "10")),
@@ -99,7 +99,7 @@ class AppConfig:
             max_position=int(os.getenv("MAX_POSITION", "500")),
 
             # Gateway
-            gateway_rate_limit_ms=int(os.getenv("GATEWAY_RATE_LIMIT_MS", "50")),
+            gateway_rate_limit_ms=int(os.getenv("GATEWAY_RATE_LIMIT_MS", "25")),
 
             # Binance
             binance_poll_hz=int(os.getenv("BINANCE_POLL_HZ", "20")),

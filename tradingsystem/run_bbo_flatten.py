@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-Live Integration Test Runner with DummyStrategy.
+Live Integration Test Runner with BBOFlattenStrategy.
 
-Runs the full trading system with safe 1-cent orders.
-Tests all components:
-- PM Market WS (order book)
-- PM User WS (order acks, fills)
-- Binance poller (fair price)
-- Strategy runner
-- Executor
-- Gateway
+Runs the full trading system with BBO market making:
+- When FLAT: Quote both sides at BBO
+- When LONG: Only quote ask (to flatten)
+- When SHORT: Only quote bid (to flatten)
 
 Usage:
     export PM_PRIVATE_KEY=0x...
     export PM_FUNDER=0x...  # if using proxy wallet
     export BINANCE_SNAPSHOT_URL=http://localhost:8080/snapshot/latest
-    python -m tradingsystem.run_dummy_test
+    python -m tradingsystem.run_bbo_flatten
 
 Or without Binance (PM-only test):
     export PM_PRIVATE_KEY=0x...
-    python -m tradingsystem.run_dummy_test --no-binance
+    python -m tradingsystem.run_bbo_flatten --no-binance
 """
 
 import argparse
@@ -30,11 +26,11 @@ import time
 
 from .config import AppConfig
 from .app import MMApplication
-from .strategy.examples.dummy import DummyStrategy
+from .strategy.examples.bbo_flatten import BBOFlattenStrategy
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run live integration test with DummyStrategy")
+    parser = argparse.ArgumentParser(description="Run live test with BBOFlattenStrategy")
     parser.add_argument(
         "--no-binance",
         action="store_true",
@@ -53,6 +49,12 @@ def main():
         help="Order size in shares (default: 5)",
     )
     parser.add_argument(
+        "--edge",
+        type=int,
+        default=-1,
+        help="Cents to improve BBO (0=join, 1=improve by 1 cent)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable DEBUG logging",
@@ -66,7 +68,7 @@ def main():
         format="%(asctime)s | %(levelname)-5s | %(name)-20s | %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    logger = logging.getLogger("DummyTest")
+    logger = logging.getLogger("BBOFlatten")
 
     # Load config from environment
     config = AppConfig.from_env()
@@ -82,17 +84,20 @@ def main():
     if args.no_binance:
         config.binance_snapshot_url = ""  # Disable poller
 
-    # Create dummy strategy
-    strategy = DummyStrategy(size=args.size)
+    # Create BBO flatten strategy
+    strategy = BBOFlattenStrategy(size=args.size, edge=args.edge)
 
     # Create application
     logger.info("=" * 60)
-    logger.info("LIVE INTEGRATION TEST - DummyStrategy")
+    logger.info("LIVE TEST - BBOFlattenStrategy")
     logger.info("=" * 60)
     logger.info(f"Order size: {args.size} shares")
-    logger.info(f"YES bid: 0.01 (1 cent)")
-    logger.info(f"NO bid: 0.01 (1 cent via 99c ask)")
-    logger.info("These orders will NOT get filled (prices too far from market)")
+    logger.info(f"Edge: {args.edge} cents (0=join BBO)")
+    logger.info("")
+    logger.info("Behavior:")
+    logger.info("  FLAT  -> quote BOTH sides at BBO")
+    logger.info("  LONG  -> quote only ASK (to flatten)")
+    logger.info("  SHORT -> quote only BID (to flatten)")
     logger.info("=" * 60)
 
     app = MMApplication(config, strategy=strategy)
@@ -154,9 +159,15 @@ def _log_stats(logger, stats):
 
     if "inventory" in stats:
         inv = stats["inventory"]
+        net = inv['net_E']
+        if net > 0:
+            pos_str = f"LONG {net}"
+        elif net < 0:
+            pos_str = f"SHORT {abs(net)}"
+        else:
+            pos_str = "FLAT"
         logger.info(
-            f"Inventory: YES={inv['yes']} NO={inv['no']} "
-            f"net_E={inv['net_E']} gross_G={inv['gross_G']}"
+            f"Position: {pos_str} (YES={inv['yes']} NO={inv['no']} gross={inv['gross_G']})"
         )
 
     if "strategy" in stats:

@@ -82,7 +82,7 @@ class GatewayWorker:
         rest_client: PolymarketRestClient,
         action_deque: ActionDeque,
         result_callback: Callable[[GatewayResult], None],
-        min_action_interval_ms: int = 50,  # 20 actions/sec max
+        min_action_interval_ms: int = 25,  # 40 actions/sec max
     ):
         """
         Initialize the gateway worker.
@@ -226,12 +226,16 @@ class GatewayWorker:
         # Convert cents to price [0, 1]
         price = spec.px / 100.0
 
+        t0 = now_ms()
         result = self._rest.place_order(
             token_id=spec.token_id,
             side=spec.side,
             price=price,
             size=spec.sz,
         )
+        latency_ms = now_ms() - t0
+        order_id_short = result.order_id[:16] if result.order_id else "none"
+        logger.info(f"[LATENCY] http_place: {latency_ms}ms order={order_id_short}... {'OK' if result.success else 'FAIL'}")
 
         return GatewayResult(
             action_id=action.action_id,
@@ -251,7 +255,10 @@ class GatewayWorker:
                 error_kind="MISSING_ORDER_ID",
             )
 
+        t0 = now_ms()
         result = self._rest.cancel_order(order_id)
+        latency_ms = now_ms() - t0
+        logger.info(f"[LATENCY] http_cancel: {latency_ms}ms order={order_id[:16]}... {'OK' if result.success else 'FAIL'}")
 
         return GatewayResult(
             action_id=action.action_id,

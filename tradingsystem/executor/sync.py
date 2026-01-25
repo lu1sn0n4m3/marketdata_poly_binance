@@ -67,10 +67,20 @@ def sync_balances(
         # Fetch balances
         balances = rest_client.get_balances()
 
+        # Check if we got valid data - empty dict means API failed
+        if not balances:
+            logger.warning("sync_balances: No balance data returned, preserving existing inventory")
+            return SyncResult(
+                success=False,
+                error="No balance data returned from API",
+                yes_balance=state.inventory.I_yes,
+                no_balance=state.inventory.I_no,
+            )
+
         yes_balance = int(balances.get(yes_token_id, 0))
         no_balance = int(balances.get(no_token_id, 0))
 
-        # Update state
+        # Update state only if we have actual data
         state.inventory.I_yes = yes_balance
         state.inventory.I_no = no_balance
         state.inventory.last_update_ts = now_ms()

@@ -152,9 +152,19 @@ def plan_execution(
        - Either aggregate whole target, or place only executable portion
     5. Every order in output is legal (>= min_size or empty plan)
 
+    CRITICAL - SETTLED vs PENDING INVENTORY:
+    SELL orders use SETTLED inventory only (I_yes, I_no), NOT pending.
+    Pending inventory (MATCHED but not MINED) cannot be sold because
+    tokens are not yet in the wallet. This is why we pass inventory.I_yes
+    to available_yes() rather than inventory.effective_yes.
+
+    The STRATEGY sees effective inventory (settled + pending) to avoid
+    placing duplicate orders, but the PLANNER uses settled inventory
+    for SELL sizing.
+
     Args:
         intent: Strategy's desired quote state (YES-space)
-        inventory: Current settled inventory
+        inventory: Current inventory (uses settled portion for SELL sizing)
         reservations: Reservation ledger for available inventory
         yes_token_id: YES token ID for this market
         no_token_id: NO token ID for this market
@@ -166,7 +176,8 @@ def plan_execution(
     """
     from ..types import now_ms
 
-    # Calculate available inventory
+    # Calculate available inventory - SETTLED ONLY (not pending)
+    # Pending inventory cannot be sold - it's not in the wallet yet
     avail_yes = reservations.available_yes(inventory.I_yes)
     avail_no = reservations.available_no(inventory.I_no)
 
@@ -227,6 +238,10 @@ def _plan_bid_leg(
     reduce_size = min(target_size, avail_no)
     complement_size = target_size - reduce_size
 
+    # Skip min-size for marketable dust cleanup orders
+    # (Polymarket has no min_size for marketable orders)
+    effective_min_size = 0 if leg.skip_min_size else min_size
+
     # Apply min-size as a COUPLED decision
     return _apply_min_size_to_split(
         reduce_size=reduce_size,
@@ -237,7 +252,7 @@ def _plan_bid_leg(
         complement_px=px_yes,
         target_size=target_size,
         policy=policy,
-        min_size=min_size,
+        min_size=effective_min_size,
         is_bid=True,
     )
 
@@ -273,6 +288,10 @@ def _plan_ask_leg(
     reduce_size = min(target_size, avail_yes)
     complement_size = target_size - reduce_size
 
+    # Skip min-size for marketable dust cleanup orders
+    # (Polymarket has no min_size for marketable orders)
+    effective_min_size = 0 if leg.skip_min_size else min_size
+
     # Apply min-size as a COUPLED decision
     return _apply_min_size_to_split(
         reduce_size=reduce_size,
@@ -283,7 +302,7 @@ def _plan_ask_leg(
         complement_px=px_no,
         target_size=target_size,
         policy=policy,
-        min_size=min_size,
+        min_size=effective_min_size,
         is_bid=False,
     )
 

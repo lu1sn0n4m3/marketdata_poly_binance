@@ -58,9 +58,11 @@ class TradeLogger:
         if not self._file:
             return
 
+        # Use current wall clock time for logging (ts param is monotonic)
+        now = datetime.now()
         record = {
-            "ts": ts,
-            "time": datetime.fromtimestamp(ts / 1000).isoformat(),
+            "ts": int(now.timestamp() * 1000),
+            "time": now.isoformat(),
             "token": token,
             "side": side,
             "size": size,

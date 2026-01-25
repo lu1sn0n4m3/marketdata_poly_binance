@@ -34,11 +34,20 @@ class ExecutorMode(Enum):
     """
     Overall executor mode.
 
-    NORMAL:    Normal operation
-    RESYNCING: Resync in progress, block new order submissions
+    NORMAL:    Normal operation - strategy intents processed
+    RESYNCING: Resync in progress - block new order submissions
+    CLOSING:   Emergency close in progress - cancel all, then close positions
+    STOPPED:   Terminal state - no more trading, requires restart
+
+    State transitions:
+        NORMAL → RESYNCING → NORMAL (resync cycle)
+        NORMAL → CLOSING → STOPPED (emergency close)
+        RESYNCING → CLOSING → STOPPED (emergency close during resync)
     """
     NORMAL = "normal"
     RESYNCING = "resyncing"
+    CLOSING = "closing"
+    STOPPED = "stopped"
 
 
 @dataclass
@@ -89,9 +98,28 @@ class OrderSlot:
     # Track if we're waiting for a SELL cancel before placing replacement SELL
     sell_blocked_until_cancel_ack: bool = False
 
+    # Rate limiting: last time we submitted any operation (place or cancel)
+    last_submit_ts: int = 0
+
     def can_submit(self) -> bool:
         """Only allow submissions in IDLE state."""
         return self.state == SlotState.IDLE
+
+    def is_rate_limited(self, current_ts: int, min_interval_ms: int) -> bool:
+        """
+        Check if enough time has passed since last submission.
+
+        Returns True if we're rate limited (should NOT reconcile yet).
+        Returns False if it's ok to reconcile.
+        """
+        if min_interval_ms <= 0:
+            return False
+        elapsed = current_ts - self.last_submit_ts
+        return elapsed < min_interval_ms
+
+    def record_submission(self, ts: int) -> None:
+        """Record that we submitted an operation at this timestamp."""
+        self.last_submit_ts = ts
 
     def has_pending_sell_cancel(self) -> bool:
         """Check if there's a pending cancel for a SELL order."""
@@ -151,6 +179,11 @@ class ReservationLedger:
     IMPORTANT: This is a VIEW computed from working orders.
     Use incremental updates for performance, but always support
     full rebuild from working orders via rebuild_from_slots().
+
+    CRITICAL: Available inventory uses SETTLED inventory only!
+    Pending inventory (MATCHED but not MINED) cannot be sold because
+    tokens are not yet in the wallet. The planner should pass
+    inventory.I_yes/I_no (settled) NOT inventory.effective_yes/no.
 
     Available inventory = settled - reserved - safety_buffer
     """
