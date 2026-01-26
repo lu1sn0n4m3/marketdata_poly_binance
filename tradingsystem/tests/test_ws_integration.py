@@ -29,8 +29,7 @@ import json
 
 from tradingsystem.caches import PolymarketCache
 from tradingsystem.feeds import PolymarketMarketFeed, PolymarketUserFeed
-from tradingsystem.market_finder import build_market_slug, get_current_hour_et
-from tradingsystem.gamma_client import GammaClient
+from tradingsystem.clients import build_market_slug, get_current_hour_et, GammaClient
 
 # Configure logging
 logging.basicConfig(

@@ -15,7 +15,7 @@ from tradingsystem.types import (
     ExecutorEventType,
     RealOrderSpec,
 )
-from tradingsystem.pm_rest_client import (
+from tradingsystem.clients import (
     PolymarketRestClient,
     OrderResult,
     CancelResult,

@@ -11,10 +11,10 @@ Tests the replacement policy:
 import pytest
 from typing import Literal
 
-from ..reconciler import reconcile_slot, _should_replace
-from ..planner import OrderKind, PlannedOrder, LegPlan
-from ..state import OrderSlot, SlotState
-from ...types import Token, Side, RealOrderSpec, WorkingOrder, OrderStatus
+from tradingsystem.executor.reconciler import reconcile_slot, _should_replace
+from tradingsystem.executor.planner import OrderKind, PlannedOrder, LegPlan
+from tradingsystem.executor.state import OrderSlot, SlotState
+from tradingsystem.types import Token, Side, RealOrderSpec, WorkingOrder, OrderStatus
 
 
 def make_working_order(

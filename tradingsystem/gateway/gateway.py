@@ -86,7 +86,7 @@ class Gateway:
                                        This prevents stale orders from being
                                        placed after a cancel-all.
         """
-        from ..pm_rest_client import PolymarketRestClient
+        from ..clients import PolymarketRestClient
 
         self._rest = rest_client
         self._result_queue = result_queue

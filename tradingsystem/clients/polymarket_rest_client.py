@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
 
-from .types import Token, Side
+from ..types import Token, Side
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock, patch
 
-from tradingsystem.market_finder import (
+from tradingsystem.clients.market_finder import (
     BitcoinHourlyMarketFinder,
     MarketScheduler,
     build_market_slug,
@@ -16,7 +16,7 @@ from tradingsystem.market_finder import (
     extract_reference_price,
     ET,
 )
-from tradingsystem.gamma_client import GammaClient
+from tradingsystem.clients import GammaClient
 
 
 class TestBuildMarketSlug:

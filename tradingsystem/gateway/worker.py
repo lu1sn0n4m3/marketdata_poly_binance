@@ -17,7 +17,7 @@ from ..types import (
     GatewayResult,
     now_ms,
 )
-from ..pm_rest_client import PolymarketRestClient
+from ..clients import PolymarketRestClient
 from .action_deque import ActionDeque
 
 logger = logging.getLogger(__name__)

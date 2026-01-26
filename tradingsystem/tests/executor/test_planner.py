@@ -16,16 +16,16 @@ Key test scenarios from the design spec:
 import pytest
 from dataclasses import dataclass
 
-from ..planner import (
+from tradingsystem.executor.planner import (
     plan_execution,
     OrderKind,
     PlannedOrder,
     LegPlan,
     ExecutionPlan,
 )
-from ..policies import MinSizePolicy
-from ..state import ReservationLedger
-from ...types import Token, Side, DesiredQuoteLeg, DesiredQuoteSet, QuoteMode
+from tradingsystem.executor.policies import MinSizePolicy
+from tradingsystem.executor.state import ReservationLedger
+from tradingsystem.types import Token, Side, DesiredQuoteLeg, DesiredQuoteSet, QuoteMode
 
 
 @dataclass

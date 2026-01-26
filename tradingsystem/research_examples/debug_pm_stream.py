@@ -16,8 +16,7 @@ import sys
 import time
 import websockets
 
-from .market_finder import build_market_slug, get_current_hour_et
-from .gamma_client import GammaClient
+from .clients import build_market_slug, get_current_hour_et, GammaClient
 
 
 def signal_handler(signum, frame):

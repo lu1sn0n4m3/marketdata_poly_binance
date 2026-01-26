@@ -49,19 +49,20 @@ from .types import (
     cents_to_price,
 )
 
-# Gamma API
-from .gamma_client import GammaClient, GammaAPIError
-
-# Market discovery
-from .market_finder import (
+# Gamma API and Market discovery
+from .clients import (
+    GammaClient,
+    GammaAPIError,
     BitcoinHourlyMarketFinder,
     MarketScheduler,
     build_market_slug,
     get_current_hour_et,
     get_next_hour_et,
-    get_target_end_time,
-    parse_market_end_time,
     extract_reference_price,
+    PolymarketRestClient,
+    OrderResult,
+    CancelResult,
+    OrderType,
 )
 
 # Snapshot caches
@@ -79,8 +80,7 @@ from .feeds import (
     PM_USER_WS_URL,
 )
 
-# REST client and Gateway
-from .pm_rest_client import PolymarketRestClient, OrderResult, CancelResult, OrderType
+# Gateway
 from .gateway import Gateway, GatewayWorker, GatewayStats, ActionDeque
 
 # Strategy

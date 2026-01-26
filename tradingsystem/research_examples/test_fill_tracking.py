@@ -24,11 +24,9 @@ from typing import Optional
 
 import orjson
 
-from .pm_rest_client import PolymarketRestClient
+from .clients import PolymarketRestClient, GammaClient, BitcoinHourlyMarketFinder
 from .feeds.websocket_base import ThreadedWsClient
 from .types import Token, Side, now_ms
-from .gamma_client import GammaClient
-from .market_finder import BitcoinHourlyMarketFinder
 import asyncio
 
 # Configure logging

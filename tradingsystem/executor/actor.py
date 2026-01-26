@@ -1344,4 +1344,4 @@ class ExecutorActor:
 
 
 # Import for type hints
-from ..pm_rest_client import PolymarketRestClient  # noqa: E402
+from ..clients import PolymarketRestClient  # noqa: E402

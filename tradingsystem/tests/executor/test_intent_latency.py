@@ -20,10 +20,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ..actor import ExecutorActor
-from ..policies import ExecutorPolicies
-from ...strategy import IntentMailbox
-from ...types import (
+from tradingsystem.executor.actor import ExecutorActor
+from tradingsystem.executor.policies import ExecutorPolicies
+from tradingsystem.strategy import IntentMailbox
+from tradingsystem.types import (
     QuoteMode,
     DesiredQuoteLeg,
     DesiredQuoteSet,

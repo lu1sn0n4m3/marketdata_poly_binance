@@ -37,7 +37,7 @@ from .types import (
 )
 from .caches import PolymarketCache, BinanceCache
 from .feeds import PolymarketMarketFeed, PolymarketUserFeed, BinanceFeed
-from .pm_rest_client import PolymarketRestClient
+from .clients import PolymarketRestClient, GammaClient, BitcoinHourlyMarketFinder
 from .gateway import Gateway
 from .strategy import (
     Strategy,
@@ -48,8 +48,6 @@ from .strategy import (
     IntentMailbox,
 )
 from .executor import ExecutorActor, ExecutorPolicies, ExecutorMode
-from .gamma_client import GammaClient
-from .market_finder import BitcoinHourlyMarketFinder
 
 logger = logging.getLogger(__name__)
 

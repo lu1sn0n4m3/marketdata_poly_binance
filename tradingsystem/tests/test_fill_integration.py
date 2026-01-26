@@ -21,9 +21,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, project_root)
 
 from tradingsystem.types import Token, Side, RealOrderSpec, ExecutorEventType, FillEvent, OrderAckEvent
-from tradingsystem.gamma_client import GammaClient
-from tradingsystem.market_finder import BitcoinHourlyMarketFinder, get_current_hour_et
-from tradingsystem.pm_rest_client import PolymarketRestClient
+from tradingsystem.clients import GammaClient, BitcoinHourlyMarketFinder, get_current_hour_et, PolymarketRestClient
 from tradingsystem.gateway import Gateway
 from tradingsystem.feeds import PolymarketUserFeed
 
