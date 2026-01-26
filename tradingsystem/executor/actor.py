@@ -35,6 +35,9 @@ import threading
 import time
 from typing import Optional, Callable, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from ..strategy import IntentMailbox
+
 from .state import (
     ExecutorState,
     ExecutorMode,
@@ -100,6 +103,7 @@ class ExecutorActor:
         yes_token_id: str,
         no_token_id: str,
         market_id: str,
+        intent_mailbox: Optional["IntentMailbox"] = None,
         rest_client: Optional["PolymarketRestClient"] = None,
         policies: Optional[ExecutorPolicies] = None,
         on_cancel_all: Optional[Callable[[], None]] = None,
@@ -109,16 +113,20 @@ class ExecutorActor:
 
         Args:
             gateway: Gateway for order submission
-            event_queue: Unified event queue (all inputs flow through here)
+            event_queue: Unified event queue (fills, acks, gateway results)
             yes_token_id: YES token ID for this market
             no_token_id: NO token ID for this market
             market_id: Market/condition ID for cancel-all
+            intent_mailbox: Single-slot mailbox for strategy intents (O(1) access).
+                           If provided, executor polls this for latest intent.
+                           This is preferred over receiving intents via event_queue.
             rest_client: REST client for resync operations
             policies: Executor policies (min-size, tolerances, etc.)
             on_cancel_all: Optional callback when cancel-all is triggered
         """
         self._gateway = gateway
         self._event_queue = event_queue
+        self._intent_mailbox = intent_mailbox
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
         self._market_id = market_id
@@ -192,18 +200,25 @@ class ExecutorActor:
 
     def _run_loop(self) -> None:
         """
-        Main event processing loop - SINGLE INPUT STREAM.
+        Main event processing loop.
 
-        All events come through the unified event queue.
-        No second input source, no polling race conditions.
+        Two input sources:
+        1. Event queue: fills, acks, gateway results (FIFO, deterministic)
+        2. Intent mailbox: strategy intents (single-slot, O(1) access)
+
+        The mailbox is polled after each event and on idle ticks.
+        This ensures the executor always processes the LATEST intent
+        regardless of event queue depth.
         """
         while not self._stop_event.is_set():
             try:
-                # ONLY source of input - deterministic ordering
+                # Process queued events (fills, acks, etc.)
                 event = self._event_queue.get(timeout=0.1)
                 self._dispatch_event(event)
+                # After each event, check for new intent (O(1) access)
+                self._poll_intent_mailbox()
             except queue.Empty:
-                # Periodic maintenance on timeout
+                # Periodic maintenance + mailbox poll on timeout
                 self._on_idle_tick()
             except Exception as e:
                 logger.error(f"Executor loop error: {e}", exc_info=True)
@@ -243,6 +258,29 @@ class ExecutorActor:
     # -------------------------------------------------------------------------
     # INTENT HANDLING
     # -------------------------------------------------------------------------
+
+    def _poll_intent_mailbox(self) -> None:
+        """
+        Poll the intent mailbox for new strategy intent.
+
+        This provides O(1) access to the LATEST intent regardless of event
+        queue depth. Critical for fast reaction during volatile markets.
+
+        Called:
+        - After processing each event from the queue
+        - On idle ticks
+        - When slots become idle (for immediate re-reconciliation)
+        """
+        if self._intent_mailbox is None:
+            return
+
+        from ..types import now_ms
+        ts = now_ms()
+
+        # Get latest intent (clears mailbox)
+        intent = self._intent_mailbox.get()
+        if intent is not None:
+            self._on_intent(intent, ts)
 
     def _on_intent(self, intent: "DesiredQuoteSet", ts: int) -> None:
         """Handle new strategy intent."""
@@ -906,10 +944,12 @@ class ExecutorActor:
             event.barrier_processed.set()
 
     def _on_idle_tick(self) -> None:
-        """Called on queue timeout - lightweight maintenance."""
+        """Called on queue timeout - lightweight maintenance + mailbox poll."""
         from ..types import now_ms
         ts = now_ms()
         self._cleanup_tombstones(ts)
+        # Poll mailbox for latest intent (O(1) access)
+        self._poll_intent_mailbox()
 
     def _check_timeouts(self, ts: int) -> None:
         """Check for timed-out pending operations."""

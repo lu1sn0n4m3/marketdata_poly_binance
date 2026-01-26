@@ -93,9 +93,15 @@ Orders can fill while cancel is in flight; remaining size must adjust reservatio
 Replacement SELLs must not be placed until the existing SELL is canceled (ACK received).
 This prevents venue-side double-reservation and “insufficient balance” errors.
 
-### I. Latest intent wins
+### I. Latest intent wins (O(1) via mailbox)
 There is no backlog of effect batches.
 The system converges toward the most recent intent (`last_intent`), applying it when slots are idle.
+
+Strategy intents flow through a **single-slot mailbox** (not the event queue).
+The executor polls this mailbox after every event and on idle, ensuring O(1)
+intent latency regardless of event queue depth. This is critical for fast
+reaction during market shocks - urgent "widen/STOP" intents take effect
+immediately rather than waiting behind stale intents and fills.
 
 ---
 
@@ -104,11 +110,22 @@ The system converges toward the most recent intent (`last_intent`), applying it 
 - `types/`: shared vocabulary and contracts (pending vs settled, events, order specs). No business logic.
 - `feeds/`: external ingestion (WS/HTTP). No trading logic. User-feed disconnect triggers safety action.
 - `caches/`: lock-free latest snapshots. No decisions. Staleness is reported, not acted upon.
-- `strategy/`: stateless intent generation (YES-space). Debounced. Single-slot mailbox overwrite.
-- `executor/`: the core. Planner + Reconciler + actor state machine. Enforces invariants.
+- `strategy/`: stateless intent generation (YES-space). Debounced. Publishes to single-slot mailbox.
+- `executor/`: the core. Planner + Reconciler + actor state machine. Polls mailbox for latest intent.
 - `gateway/`: exchange I/O. Priority queue + worker thread. CANCEL_ALL preempts PLACEs.
 
-If logic appears in the “wrong” module, it is almost always a regression.
+**Data flow:**
+```
+Feeds → Caches (lock-free snapshots)
+                ↓
+Strategy Runner → IntentMailbox (single-slot overwrite)
+                        ↓
+User Feed → Event Queue → Executor Actor ← polls mailbox
+                              ↓
+                          Gateway → Exchange
+```
+
+If logic appears in the "wrong" module, it is almost always a regression.
 
 ---
 

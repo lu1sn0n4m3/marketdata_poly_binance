@@ -5,10 +5,19 @@ The StrategyRunner executes the strategy at a fixed rate and publishes
 intents to the executor.
 
 Two modes of operation:
-1. Mailbox mode (legacy): Publish to an IntentMailbox, executor polls.
-2. Event queue mode (new): Push StrategyIntentEvent directly to event queue.
+1. Mailbox mode (PREFERRED): Publish to IntentMailbox, executor polls.
+   - O(1) intent latency regardless of event queue depth
+   - Critical for fast reaction during volatile markets
+   - Latest intent always wins (single-slot overwrite)
 
-Event queue mode is preferred as it provides deterministic ordering.
+2. Event queue mode (DEPRECATED): Push StrategyIntentEvent directly to event queue.
+   - Intent latency grows with queue depth
+   - Urgent intents can be delayed behind stale intents
+   - Only use for testing or backwards compatibility
+
+Mailbox mode is preferred because it ensures the executor always processes
+the LATEST intent immediately, which is critical during market shocks when
+you need to widen quotes or STOP trading instantly.
 """
 
 import logging
@@ -102,8 +111,14 @@ class StrategyRunner:
     4. Publishes intent if it changed (via mailbox or event queue)
 
     Two modes of operation:
-    - Mailbox mode: Use mailbox.put() for coalescing (legacy)
-    - Event queue mode: Push StrategyIntentEvent directly (preferred)
+    - Mailbox mode (PREFERRED): Use mailbox.put() for O(1) intent latency
+    - Event queue mode (DEPRECATED): Push StrategyIntentEvent directly
+
+    Why mailbox is preferred:
+        Under load (many fills, acks), the event queue can have many pending
+        events. With event queue mode, your urgent "widen/STOP" intent waits
+        behind stale intents. With mailbox mode, the executor polls the mailbox
+        directly and always sees the LATEST intent with O(1) latency.
 
     Debouncing:
         The runner only publishes intents that differ materially from
@@ -114,18 +129,18 @@ class StrategyRunner:
         The runner runs in its own daemon thread. It sleeps between
         ticks using Event.wait() which allows for clean shutdown.
 
-    Example (event queue mode - preferred):
+    Example (mailbox mode - PREFERRED):
         runner = StrategyRunner(
             strategy=DefaultMMStrategy(),
-            event_queue=executor_event_queue,
+            mailbox=intent_mailbox,
             get_input=get_input,
             tick_hz=20,
         )
 
-    Example (mailbox mode - legacy):
+    Example (event queue mode - DEPRECATED):
         runner = StrategyRunner(
             strategy=DefaultMMStrategy(),
-            mailbox=intent_mailbox,
+            event_queue=executor_event_queue,
             get_input=get_input,
             tick_hz=20,
         )
@@ -146,14 +161,17 @@ class StrategyRunner:
             strategy: Strategy instance to run
             get_input: Callback to get current StrategyInput.
                        Called once per tick.
-            mailbox: IntentMailbox to publish intents to (legacy mode)
-            event_queue: Event queue to push StrategyIntentEvent to (preferred)
+            mailbox: IntentMailbox to publish intents to (PREFERRED).
+                     Provides O(1) intent latency via single-slot overwrite.
+            event_queue: Event queue to push StrategyIntentEvent to (DEPRECATED).
+                         Intent latency grows with queue depth.
             tick_hz: How many times per second to run strategy.
                      Higher = more responsive, more CPU.
                      20Hz is a good balance for most markets.
 
         Note: Must provide either mailbox or event_queue (or both for hybrid).
               If both provided, intents are pushed to event_queue only.
+              For production, use mailbox mode for best latency.
         """
         if mailbox is None and event_queue is None:
             raise ValueError("Must provide either mailbox or event_queue")

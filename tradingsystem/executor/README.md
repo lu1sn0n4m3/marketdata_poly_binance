@@ -845,7 +845,57 @@ The executor handles this by:
 - Processing any fills that arrive (updating inventory and PnL)
 - Only removing the order from state after ack confirms
 
-### 3. Latest Intent Wins (No Effect Backlog)
+### 3. Two Input Sources (Event Queue + Intent Mailbox)
+
+**CRITICAL: The executor has two input sources with different semantics.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ExecutorActor                             │
+│                                                                   │
+│  ┌────────────────────┐     ┌─────────────────────────────────┐  │
+│  │   Event Queue      │     │      Intent Mailbox              │  │
+│  │   (FIFO, must not  │     │      (single-slot overwrite,    │  │
+│  │    drop events)    │     │       O(1) access)              │  │
+│  │                    │     │                                  │  │
+│  │  - Fills           │     │  - Strategy intents only        │  │
+│  │  - Acks            │     │  - Latest intent wins           │  │
+│  │  - Gateway results │     │  - Polled after every event     │  │
+│  └─────────┬──────────┘     └──────────────┬──────────────────┘  │
+│            │                               │                      │
+│            │     ┌─────────────────────┐   │                      │
+│            └────▶│    Event Loop       │◀──┘                      │
+│                  │                     │                          │
+│                  │  1. Get event       │                          │
+│                  │  2. Dispatch event  │                          │
+│                  │  3. Poll mailbox    │                          │
+│                  └─────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why two sources?**
+
+Under load (many fills during volatile markets), the event queue can have many pending events.
+If intents were in the event queue, your urgent "widen/STOP" intent would wait behind fills.
+
+With the mailbox pattern:
+- Executor processes one event from queue
+- Immediately polls mailbox for latest intent (O(1))
+- Always sees the LATEST intent, not stale ones
+
+This ensures O(1) intent latency regardless of queue depth - critical for fast reaction during market shocks.
+
+**Event Queue Rules:**
+- FIFO processing (deterministic order)
+- MUST NOT drop events (fills are critical for inventory)
+- Processed sequentially
+
+**Mailbox Rules:**
+- Single-slot overwrite (only latest intent kept)
+- Polled after every event AND on idle ticks
+- O(1) access regardless of event queue depth
+
+### 4. Latest Intent Wins (No Effect Backlog)
 
 **CRITICAL: There is no queue of effect batches. Only the latest strategy intent matters.**
 
@@ -876,7 +926,7 @@ The key mechanisms:
 
 **Important**: Fills update `remaining_sz` and inventory in real-time. The next intent arrival will reconcile against this updated state. This assumes the strategy publishes intents frequently enough that stale-quote windows are short.
 
-### 4. Kind Must Be Set (Assertion/Warning)
+### 5. Kind Must Be Set (Assertion/Warning)
 
 **CRITICAL: Every working order should have a `kind` set.**
 
@@ -897,7 +947,7 @@ WARNING: Order XYZ has kind=None - inferring from spec (this should not happen i
 
 This warning should be monitored in production. If it fires, investigate why the kind wasn't set.
 
-### 5. SELL Overlap Rule Enforcement
+### 6. SELL Overlap Rule Enforcement
 
 **CRITICAL: Never submit a replacement SELL until the original SELL is canceled.**
 
@@ -908,7 +958,7 @@ The reconciler enforces this by:
 - NOT including the replacement SELL in the `places` list
 - After cancel ack, re-reconciling places the replacement SELL
 
-### 6. Slot State Machine Invariants
+### 7. Slot State Machine Invariants
 
 | State | Can Submit? | On Ack |
 |-------|-------------|--------|
@@ -919,7 +969,7 @@ The reconciler enforces this by:
 
 **Invariant**: If slot is not IDLE, reconciler returns empty batch. No overlapping "mutating waves."
 
-### 7. Submission Ordering and Convergence Guarantee
+### 8. Submission Ordering and Convergence Guarantee
 
 **CRITICAL: The system must converge. Every plan must eventually be reflected in working orders.**
 
@@ -956,13 +1006,14 @@ Potential gap (by design):
 - If strategy stops publishing intents, fills won't trigger reconciliation
 - This is acceptable: no new intent = no desired state change = no action needed
 
-### 8. Checklist: Sim vs Live
+### 9. Checklist: Sim vs Live
 
 | Property | Sim | Live | Status |
 |----------|-----|------|--------|
 | Cancel ack before reservation release | Optional | REQUIRED | ✅ Implemented |
 | Order fills during cancel flight | Rare | Common | ✅ Handled |
 | Latest intent wins (no backlog) | Nice-to-have | REQUIRED | ✅ Implemented |
+| Intent via mailbox (O(1) latency) | Optional | REQUIRED | ✅ Implemented |
 | Kind always set on WorkingOrder | Optional | REQUIRED | ✅ Enforced (warning if None) |
 | SELL overlap blocked | Optional | REQUIRED | ✅ Enforced |
 | Tombstones for orphan fills | Optional | REQUIRED | ✅ Implemented |

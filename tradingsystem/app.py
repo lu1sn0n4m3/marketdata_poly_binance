@@ -6,14 +6,20 @@ Uses threading for all components (no asyncio in main loop).
 
 Component threading layout:
 - Thread 1: PM Market WS → PolymarketCache
-- Thread 2: PM User WS → Executor event queue
+- Thread 2: PM User WS → Executor event queue (fills, acks)
 - Thread 3: Binance Poller → BinanceCache
-- Thread 4: Strategy Runner → Executor event queue (direct)
+- Thread 4: Strategy Runner → IntentMailbox (single-slot overwrite)
 - Thread 5: Executor Actor → Gateway
 - Thread 6: Gateway Worker
 
-Note: The executor uses a unified event queue - all inputs (intents, fills, acks)
-flow through a single queue for deterministic ordering.
+Note: The executor uses two input sources:
+1. Event queue: fills, acks, gateway results (FIFO, must not drop)
+2. Intent mailbox: strategy intents (single-slot overwrite, O(1) access)
+
+The mailbox pattern ensures the executor always sees the LATEST intent
+regardless of event queue depth. This is critical for fast reaction
+during volatile markets - urgent "widen/STOP" intents take effect
+immediately rather than waiting behind stale intents.
 """
 
 import asyncio
@@ -39,6 +45,7 @@ from .strategy import (
     StrategyConfig,
     StrategyInput,
     StrategyRunner,
+    IntentMailbox,
 )
 from .executor import ExecutorActor, ExecutorPolicies, ExecutorMode
 from .gamma_client import GammaClient
@@ -87,6 +94,7 @@ class MMApplication:
         self._executor: Optional[ExecutorActor] = None
 
         self._event_queue: Optional[queue.Queue] = None
+        self._intent_mailbox: Optional[IntentMailbox] = None
 
         # Market discovery
         self._gamma: Optional[GammaClient] = None
@@ -105,8 +113,13 @@ class MMApplication:
         self._pm_cache = PolymarketCache()
         self._bn_cache = BinanceCache()
 
-        # Event queue for executor (unified: fills, acks, intents from User WS and Strategy)
+        # Event queue for executor (unified: fills, acks from User WS)
+        # Note: Strategy intents use a separate single-slot mailbox for O(1) latency
         self._event_queue = queue.Queue(maxsize=1000)
+
+        # Intent mailbox - single-slot overwrite for strategy intents
+        # This ensures the executor always sees the LATEST intent regardless of queue depth
+        self._intent_mailbox = IntentMailbox()
 
         # REST client
         self._rest_client = PolymarketRestClient(
@@ -170,11 +183,13 @@ class MMApplication:
         # Strategy
         strategy = self._custom_strategy or DefaultMMStrategy(strategy_config)
 
-        # Strategy runner - push intents directly to event queue
+        # Strategy runner - publish intents to single-slot mailbox
+        # Mailbox provides O(1) intent latency regardless of event queue depth
+        # This is critical for fast reaction during volatile markets
         self._strategy_runner = StrategyRunner(
             strategy=strategy,
             get_input=self._get_strategy_input,
-            event_queue=self._event_queue,  # Direct to executor event queue
+            mailbox=self._intent_mailbox,  # Single-slot overwrite (preferred)
             tick_hz=cfg.strategy_hz,
         )
 
@@ -200,6 +215,7 @@ class MMApplication:
         self._executor = ExecutorActor(
             gateway=self._gateway,
             event_queue=self._event_queue,
+            intent_mailbox=self._intent_mailbox,  # Single-slot mailbox for O(1) intent access
             yes_token_id=market.yes_token_id,
             no_token_id=market.no_token_id,
             market_id=market.condition_id,

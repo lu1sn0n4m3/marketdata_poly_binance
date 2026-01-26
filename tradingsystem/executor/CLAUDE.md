@@ -126,6 +126,34 @@ If strategy stops publishing, the executor should remain safe (no new intent ⇒
 
 ---
 
+## Two input sources (critical for latency)
+
+The executor has two input sources:
+
+### 1. Event Queue (FIFO, must not drop)
+- Fills, acks, gateway results
+- Processed sequentially for deterministic ordering
+- Events MUST NOT be dropped (fills are critical)
+
+### 2. Intent Mailbox (single-slot, O(1) access)
+- Strategy intents (desired quotes)
+- Single-slot overwrite - only latest intent kept
+- Executor polls after every event and on idle
+
+**Why two sources?**
+Under load (many fills during volatility), the event queue can have many pending events.
+If intents were in the queue, your urgent "widen/STOP" intent would wait behind fills.
+
+With the mailbox pattern:
+- Executor processes one event from queue
+- Immediately polls mailbox for latest intent (O(1))
+- Always sees the LATEST intent, not stale ones
+
+This ensures O(1) intent latency regardless of queue depth, critical for fast
+reaction during market shocks.
+
+---
+
 ## RESYNCING mode exists for a reason
 
 RESYNCING is a safety recovery path when the world becomes inconsistent:

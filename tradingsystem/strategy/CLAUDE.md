@@ -70,7 +70,7 @@ If you encode venue mechanics in strategy, you will break determinism and duplic
 
 ---
 
-## Runner + Mailbox semantics (do not “optimize”)
+## Runner + Mailbox semantics (critical for latency)
 
 ### Runner
 `StrategyRunner` runs on a fixed cadence (e.g., ~20 Hz):
@@ -81,13 +81,22 @@ If you encode venue mechanics in strategy, you will break determinism and duplic
 
 The runner is allowed to skip publishing when unchanged. That is intentional.
 
-### IntentMailbox
+### IntentMailbox (PREFERRED - O(1) intent latency)
 Mailbox is a **single-slot overwrite**:
 - it keeps only the latest intent
 - older intents are discarded
+- executor polls directly with O(1) access
 
 This is critical: **latest intent wins**. There is no intent queue.
-Do not replace it with a buffered queue “for reliability” — that creates stale-action backlog and thrash.
+
+**Why mailbox mode is mandatory for production:**
+During market shocks (BTC drops 2%), you need to widen quotes or STOP immediately.
+With event queue mode, your urgent intent waits behind stale intents and fills.
+With mailbox mode, the executor polls the mailbox after every event and on idle,
+ensuring O(1) latency to process the latest intent regardless of queue depth.
+
+Do not replace mailbox with a buffered queue "for reliability" — that creates
+stale-action backlog, increased latency, and gets you picked off during volatility.
 
 ---
 
