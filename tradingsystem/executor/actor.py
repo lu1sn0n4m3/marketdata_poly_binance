@@ -134,6 +134,11 @@ class ExecutorActor:
         # This ensures proper dedup when same trade arrives as MATCHED->MINED->CONFIRMED
         self._processed_fills: set[str] = set()
 
+        # Track consecutive insufficient balance errors to detect state divergence
+        # Resync after N consecutive failures (indicates reservation/inventory mismatch)
+        self._consecutive_balance_errors: int = 0
+        self._max_balance_errors_before_resync: int = 3
+
         # Threading
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -477,7 +482,11 @@ class ExecutorActor:
         """Handle place result for a slot."""
         from ..types import OrderStatus, WorkingOrder, Side, Token
 
-        pending = slot.pending_places.pop(action_id)
+        # Atomic pop - may return None if timeout handler already removed it
+        pending = slot.pending_places.pop(action_id, None)
+        if pending is None:
+            logger.debug(f"Place result for already-cleared action: {action_id}")
+            return
 
         if event.success and event.server_order_id:
             # Create working order with kind from pending place
@@ -492,6 +501,8 @@ class ExecutorActor:
             )
             slot.orders[event.server_order_id] = order
             logger.debug(f"Order placed: {event.server_order_id[:20]}... (kind={pending.order_kind})")
+            # Reset balance error counter on success
+            self._consecutive_balance_errors = 0
         else:
             # Place failed - release reservation if SELL
             if pending.spec.side == Side.SELL:
@@ -500,20 +511,27 @@ class ExecutorActor:
                 else:
                     self._state.reservations.release_no(pending.spec.sz)
 
-            # Log error - DON'T resync on every balance error
-            # "Insufficient balance" often happens due to race conditions:
-            # - Multiple orders competing for same USDC
-            # - Partial fills changing available balance
-            # Let the next reconcile cycle handle it naturally
+            # Handle errors - track consecutive balance errors for resync trigger
             error_code = normalize_error(event.error_kind)
             if error_code == ErrorCode.INSUFFICIENT_BALANCE:
+                self._consecutive_balance_errors += 1
                 logger.warning(
                     f"Insufficient balance for {pending.spec.token.name} "
-                    f"{pending.spec.side.name} {pending.spec.sz}@{pending.spec.px}c - "
-                    f"will retry on next intent"
+                    f"{pending.spec.side.name} {pending.spec.sz}@{pending.spec.px}c "
+                    f"(consecutive: {self._consecutive_balance_errors}/{self._max_balance_errors_before_resync})"
                 )
+                # Trigger resync after N consecutive failures - indicates state divergence
+                if self._consecutive_balance_errors >= self._max_balance_errors_before_resync:
+                    logger.error(
+                        f"Consecutive balance errors exceeded threshold "
+                        f"({self._consecutive_balance_errors}), triggering resync"
+                    )
+                    self._consecutive_balance_errors = 0
+                    self._trigger_resync("consecutive_balance_errors")
             else:
                 logger.warning(f"Place failed: {event.error_kind}")
+                # Reset counter on non-balance errors (different failure mode)
+                self._consecutive_balance_errors = 0
 
         # Check if slot can transition back to IDLE
         slot.on_ack_received()
@@ -531,7 +549,11 @@ class ExecutorActor:
         """Handle cancel result for a slot."""
         from ..types import Side, Token
 
-        pending = slot.pending_cancels.pop(action_id)
+        # Atomic pop - may return None if timeout handler already removed it
+        pending = slot.pending_cancels.pop(action_id, None)
+        if pending is None:
+            logger.debug(f"Cancel result for already-cleared action: {action_id}")
+            return
 
         if event.success:
             # Remove from working orders

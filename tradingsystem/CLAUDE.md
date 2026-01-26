@@ -141,6 +141,12 @@ If any answer is “maybe,” you need tests before changes.
 
 ---
 
+## Running code
+
+Its very important you actually use `source .venv/bin/activate` before running code in order to activate the virtual environment with the installed packages.
+
+---
+
 ## Where to read next
 
 Each major module has its own CLAUDE.md with local invariants:

@@ -437,15 +437,26 @@ class PolymarketUserFeed(ThreadedWsClient):
         """
         Enqueue event to Executor. MUST NOT DROP.
 
-        Uses blocking put if queue is full.
+        Uses bounded blocking with timeout to avoid indefinite hang.
+        If timeout expires, escalates but still enqueues (fills must not be dropped).
         """
         try:
             self._event_queue.put_nowait(event)
         except queue.Full:
-            # This should never happen with properly sized queue
-            # Log error and block to ensure event is not dropped
-            logger.error("PolymarketUserFeed: Event queue full! Blocking to enqueue")
-            self._event_queue.put(event, block=True)
+            # Queue full - use bounded blocking with escalation
+            logger.warning("PolymarketUserFeed: Event queue full, blocking with timeout")
+            try:
+                # Wait up to 5s - if executor is stuck longer, we have bigger problems
+                self._event_queue.put(event, block=True, timeout=5.0)
+            except queue.Full:
+                # Timeout expired - executor is severely behind or stuck
+                # CRITICAL: Still must enqueue (fills cannot be dropped)
+                # Log critical and force blocking put
+                logger.critical(
+                    "PolymarketUserFeed: Queue blocked >5s - executor may be stuck! "
+                    "Consider emergency close."
+                )
+                self._event_queue.put(event, block=True)
 
     def _on_connect(self) -> None:
         """Called after successful connection."""
