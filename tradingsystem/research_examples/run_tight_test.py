@@ -77,7 +77,8 @@ def main():
 
     # Adjust config for test
     if args.no_binance:
-        config.binance_snapshot_url = ""
+        config.binance_pricer_url = ""  # Disable pricer poller
+        config.binance_ws_url = ""  # Disable Binance WS feed
 
     # Create tight strategy
     strategy = DummyTightStrategy(size=args.size)

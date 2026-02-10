@@ -7,10 +7,11 @@ Uses threading for all components (no asyncio in main loop).
 Component threading layout:
 - Thread 1: PM Market WS → PolymarketCache
 - Thread 2: PM User WS → Executor event queue (fills, acks)
-- Thread 3: Binance Poller → BinanceCache
-- Thread 4: Strategy Runner → IntentMailbox (single-slot overwrite)
-- Thread 5: Executor Actor → Gateway
-- Thread 6: Gateway Worker
+- Thread 3: Binance WS (bookTicker + trade) → BinanceCache
+- Thread 4: Binance Pricer Poller (optional) → PricerEnrichment
+- Thread 5: Strategy Runner → IntentMailbox (single-slot overwrite)
+- Thread 6: Executor Actor → Gateway
+- Thread 7: Gateway Worker
 
 Note: The executor uses two input sources:
 1. Event queue: fills, acks, gateway results (FIFO, must not drop)
@@ -36,7 +37,13 @@ from .types import (
     now_ms,
 )
 from .caches import PolymarketCache, BinanceCache
-from .feeds import PolymarketMarketFeed, PolymarketUserFeed, BinanceFeed
+from .feeds import (
+    PolymarketMarketFeed,
+    PolymarketUserFeed,
+    BinanceFeed,
+    BinancePricerPoller,
+    PricerEnrichment,
+)
 from .clients import PolymarketRestClient, GammaClient, BitcoinHourlyMarketFinder
 from .gateway import Gateway
 from .strategy import (
@@ -83,7 +90,9 @@ class MMApplication:
 
         self._pm_market_ws: Optional[PolymarketMarketFeed] = None
         self._pm_user_ws: Optional[PolymarketUserFeed] = None
-        self._bn_poller: Optional[BinanceFeed] = None
+        self._bn_feed: Optional[BinanceFeed] = None
+        self._bn_pricer_poller: Optional[BinancePricerPoller] = None
+        self._bn_enrichment: Optional[PricerEnrichment] = None
 
         self._rest_client: Optional[PolymarketRestClient] = None
         self._gateway: Optional[Gateway] = None
@@ -159,12 +168,22 @@ class MMApplication:
             ws_url=cfg.pm_ws_user_url,
         )
 
-        # Binance poller (only if URL provided)
-        if cfg.binance_snapshot_url:
-            self._bn_poller = BinanceFeed(
+        # Binance WebSocket feed (real-time BBO + trades)
+        # Optional pricer enrichment for p_yes and computed features
+        self._bn_enrichment = PricerEnrichment()
+        if cfg.binance_pricer_url:
+            self._bn_pricer_poller = BinancePricerPoller(
+                enrichment=self._bn_enrichment,
+                url=cfg.binance_pricer_url,
+                poll_hz=cfg.binance_pricer_poll_hz,
+            )
+
+        if cfg.binance_ws_url:
+            self._bn_feed = BinanceFeed(
                 cache=self._bn_cache,
-                url=cfg.binance_snapshot_url,
-                poll_hz=cfg.binance_poll_hz,
+                symbol=cfg.binance_symbol,
+                enrichment=self._bn_enrichment,
+                ws_url=cfg.binance_ws_url,
             )
 
         # Strategy config
@@ -362,8 +381,10 @@ class MMApplication:
         # Start data feeds
         self._pm_market_ws.start()
         self._pm_user_ws.start()
-        if self._bn_poller:
-            self._bn_poller.start()
+        if self._bn_feed:
+            self._bn_feed.start()
+        if self._bn_pricer_poller:
+            self._bn_pricer_poller.start()
 
         # Wait for initial data
         logger.info("Waiting for initial market data...")
@@ -424,8 +445,11 @@ class MMApplication:
         if self._gateway:
             self._gateway.stop()
 
-        if self._bn_poller:
-            self._bn_poller.stop()
+        if self._bn_pricer_poller:
+            self._bn_pricer_poller.stop()
+
+        if self._bn_feed:
+            self._bn_feed.stop()
 
         if self._pm_user_ws:
             self._pm_user_ws.stop()
@@ -539,8 +563,10 @@ class MMApplication:
             stats["bn_cache_seq"] = self._bn_cache.seq
             stats["bn_cache_stale"] = self._bn_cache.is_stale()
 
-        if self._bn_poller:
-            stats["bn_poller"] = self._bn_poller.stats
+        if self._bn_feed:
+            stats["bn_feed"] = self._bn_feed.stats
+        if self._bn_pricer_poller:
+            stats["bn_pricer_poller"] = self._bn_pricer_poller.stats
 
         if self._strategy_runner:
             stats["strategy"] = self._strategy_runner.stats

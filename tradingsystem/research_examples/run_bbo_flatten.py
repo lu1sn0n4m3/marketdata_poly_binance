@@ -82,7 +82,8 @@ def main():
 
     # Adjust config for test
     if args.no_binance:
-        config.binance_snapshot_url = ""  # Disable poller
+        config.binance_pricer_url = ""  # Disable pricer poller
+        config.binance_ws_url = ""  # Disable Binance WS feed
 
     # Create BBO flatten strategy
     strategy = BBOFlattenStrategy(size=args.size, edge=args.edge)

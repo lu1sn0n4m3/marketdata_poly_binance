@@ -22,7 +22,9 @@ class AppConfig:
     pm_ws_user_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     pm_rest_url: str = "https://clob.polymarket.com"
     gamma_api_url: str = "https://gamma-api.polymarket.com"
-    binance_snapshot_url: str = "http://localhost:8080/snapshot/latest"
+    binance_ws_url: str = "wss://stream.binance.com:9443/stream"
+    binance_symbol: str = "BTCUSDT"
+    binance_pricer_url: str = "http://localhost:8080/snapshot/latest"  # Optional pricer enrichment
 
     # Strategy
     strategy_hz: int = 50
@@ -47,8 +49,8 @@ class AppConfig:
     # Gateway
     gateway_rate_limit_ms: int = 25  # 40 actions/sec
 
-    # Binance poller
-    binance_poll_hz: int = 20
+    # Binance pricer poller (optional enrichment for p_yes, features)
+    binance_pricer_poll_hz: int = 5
 
     # Logging
     log_level: str = "INFO"
@@ -73,8 +75,13 @@ class AppConfig:
             ),
             pm_rest_url=os.getenv("PM_REST_URL", "https://clob.polymarket.com"),
             gamma_api_url=os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com"),
-            binance_snapshot_url=os.getenv(
-                "BINANCE_SNAPSHOT_URL",
+            binance_ws_url=os.getenv(
+                "BINANCE_WS_URL",
+                "wss://stream.binance.com:9443/stream",
+            ),
+            binance_symbol=os.getenv("BINANCE_SYMBOL", "BTCUSDT"),
+            binance_pricer_url=os.getenv(
+                "BINANCE_PRICER_URL",
                 "http://localhost:8080/snapshot/latest",
             ),
 
@@ -101,8 +108,8 @@ class AppConfig:
             # Gateway
             gateway_rate_limit_ms=int(os.getenv("GATEWAY_RATE_LIMIT_MS", "25")),
 
-            # Binance
-            binance_poll_hz=int(os.getenv("BINANCE_POLL_HZ", "20")),
+            # Binance pricer poller
+            binance_pricer_poll_hz=int(os.getenv("BINANCE_PRICER_POLL_HZ", "5")),
 
             # Logging
             log_level=os.getenv("LOG_LEVEL", "INFO"),

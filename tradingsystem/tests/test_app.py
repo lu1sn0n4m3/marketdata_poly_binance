@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import Mock, MagicMock, patch
 
 from tradingsystem.config import AppConfig
-from tradingsystem.feeds import BinanceFeed
+from tradingsystem.feeds import BinanceFeed, BinancePricerPoller, PricerEnrichment
 from tradingsystem.caches import BinanceCache
 from tradingsystem.types import MarketInfo
 
@@ -63,17 +63,131 @@ class TestAppConfig:
 
 
 class TestBinanceFeed:
-    """Tests for BinanceFeed."""
+    """Tests for BinanceFeed (WebSocket-based)."""
 
     @pytest.fixture
     def cache(self):
         """Create Binance cache."""
         return BinanceCache()
 
-    def test_poller_starts_and_stops(self, cache):
+    def test_feed_updates_cache_via_handle_message(self, cache):
+        """Test BinanceFeed parses WS messages and updates cache."""
+        import orjson
+
+        feed = BinanceFeed(cache=cache, symbol="BTCUSDT")
+
+        # Simulate a bookTicker message
+        msg = orjson.dumps({
+            "stream": "btcusdt@bookTicker",
+            "data": {
+                "s": "BTCUSDT",
+                "b": "100000.50",
+                "B": "1.5",
+                "a": "100001.00",
+                "A": "2.0",
+            },
+        })
+        feed._handle_message(msg)
+
+        assert cache.has_data
+        snapshot, _ = cache.get_latest()
+        assert snapshot is not None
+        assert snapshot.best_bid_px == 100000.50
+        assert snapshot.best_ask_px == 100001.00
+
+    def test_feed_tracks_trade_price(self, cache):
+        """Test trade messages update last trade price."""
+        import orjson
+
+        feed = BinanceFeed(cache=cache, symbol="BTCUSDT")
+
+        # Send a trade first
+        trade_msg = orjson.dumps({
+            "stream": "btcusdt@trade",
+            "data": {"p": "99999.00", "q": "0.1", "m": True},
+        })
+        feed._handle_message(trade_msg)
+        assert feed._last_trade_price == 99999.00
+
+        # Then BBO publishes with the trade price
+        bbo_msg = orjson.dumps({
+            "stream": "btcusdt@bookTicker",
+            "data": {"s": "BTCUSDT", "b": "100000.00", "B": "1.0", "a": "100001.00", "A": "1.0"},
+        })
+        feed._handle_message(bbo_msg)
+
+        snapshot, _ = cache.get_latest()
+        assert snapshot.last_trade_price == 99999.00
+
+    def test_feed_merges_pricer_enrichment(self, cache):
+        """Test BinanceFeed merges pricer enrichment into snapshots."""
+        import orjson
+
+        enrichment = PricerEnrichment()
+        enrichment.update({
+            "p_yes_fair": 0.55,
+            "t_remaining_ms": 3600000,
+            "open_price": 99500.0,
+            "features": {"ewma_vol": 0.02},
+        })
+
+        feed = BinanceFeed(cache=cache, symbol="BTCUSDT", enrichment=enrichment)
+
+        bbo_msg = orjson.dumps({
+            "stream": "btcusdt@bookTicker",
+            "data": {"s": "BTCUSDT", "b": "100000.00", "B": "1.0", "a": "100001.00", "A": "1.0"},
+        })
+        feed._handle_message(bbo_msg)
+
+        snapshot, _ = cache.get_latest()
+        assert snapshot.best_bid_px == 100000.00
+        assert snapshot.p_yes == 0.55
+        assert snapshot.t_remaining_ms == 3600000
+
+    def test_feed_stats(self, cache):
+        """Test feed stats tracking."""
+        import orjson
+
+        feed = BinanceFeed(cache=cache, symbol="BTCUSDT")
+
+        # Send a few messages
+        for _ in range(3):
+            feed._handle_message(orjson.dumps({
+                "stream": "btcusdt@bookTicker",
+                "data": {"s": "BTCUSDT", "b": "100000.00", "B": "1.0", "a": "100001.00", "A": "1.0"},
+            }))
+        feed._handle_message(orjson.dumps({
+            "stream": "btcusdt@trade",
+            "data": {"p": "100000.50", "q": "0.1", "m": False},
+        }))
+
+        stats = feed.stats
+        assert stats["bbo_count"] == 3
+        assert stats["trade_count"] == 1
+        assert stats["error_count"] == 0
+
+    def test_feed_handles_bad_messages(self, cache):
+        """Test feed handles malformed messages gracefully."""
+        feed = BinanceFeed(cache=cache, symbol="BTCUSDT")
+
+        # Bad JSON
+        feed._handle_message(b"not json")
+        assert feed.stats["error_count"] == 1
+
+        # Missing data field
+        import orjson
+        feed._handle_message(orjson.dumps({"stream": "btcusdt@bookTicker"}))
+        # Should not crash, just skip
+
+
+class TestBinancePricerPoller:
+    """Tests for BinancePricerPoller (HTTP enrichment)."""
+
+    def test_poller_starts_and_stops(self):
         """Test poller lifecycle."""
-        poller = BinanceFeed(
-            cache=cache,
+        enrichment = PricerEnrichment()
+        poller = BinancePricerPoller(
+            enrichment=enrichment,
             url="http://localhost:9999/nonexistent",
             poll_hz=10,
         )
@@ -85,12 +199,13 @@ class TestBinanceFeed:
         poller.stop()
         assert not poller.is_running
 
-    def test_poller_handles_connection_errors(self, cache):
+    def test_poller_handles_connection_errors(self):
         """Test poller handles connection errors gracefully."""
-        poller = BinanceFeed(
-            cache=cache,
+        enrichment = PricerEnrichment()
+        poller = BinancePricerPoller(
+            enrichment=enrichment,
             url="http://localhost:9999/nonexistent",
-            poll_hz=100,  # Fast polling
+            poll_hz=100,
             timeout_s=0.1,
         )
 
@@ -98,14 +213,13 @@ class TestBinanceFeed:
         time.sleep(0.3)
         poller.stop()
 
-        # Should have recorded errors
         stats = poller.stats
         assert stats["error_count"] > 0
         assert stats["last_error"] == "connection_error"
 
     @patch("tradingsystem.feeds.binance_feed.requests.get")
-    def test_poller_updates_cache_on_success(self, mock_get, cache):
-        """Test poller updates cache on successful response."""
+    def test_poller_updates_enrichment_on_success(self, mock_get):
+        """Test poller updates enrichment on successful response."""
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -117,8 +231,9 @@ class TestBinanceFeed:
         }
         mock_get.return_value = mock_response
 
-        poller = BinanceFeed(
-            cache=cache,
+        enrichment = PricerEnrichment()
+        poller = BinancePricerPoller(
+            enrichment=enrichment,
             url="http://localhost:8080/snapshot",
             poll_hz=10,
         )
@@ -127,17 +242,14 @@ class TestBinanceFeed:
         time.sleep(0.3)
         poller.stop()
 
-        # Cache should have data
-        assert cache.has_data
-        snapshot, _ = cache.get_latest()
-        assert snapshot is not None
-        assert snapshot.best_bid_px == 100000.0
-        assert snapshot.p_yes == 0.55
+        data = enrichment.get()
+        assert data.get("p_yes_fair") == 0.55
 
-    def test_poller_stats(self, cache):
+    def test_poller_stats(self):
         """Test poller stats tracking."""
-        poller = BinanceFeed(
-            cache=cache,
+        enrichment = PricerEnrichment()
+        poller = BinancePricerPoller(
+            enrichment=enrichment,
             url="http://localhost:9999/nonexistent",
             poll_hz=50,
         )
